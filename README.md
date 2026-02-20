@@ -342,6 +342,12 @@ make build  # compiles Rust → WASM, copies to monty.wasm
 make test   # builds and runs Go tests
 ```
 
+## Acknowledgments
+
+monty-go exists because of [Monty](https://github.com/pydantic/monty), created by [Samuel Colvin](https://github.com/samuelcolvin) and the [Pydantic](https://github.com/pydantic) team. Monty is a genuinely novel piece of engineering — a minimal, secure Python interpreter written from scratch in Rust, purpose-built for AI agents. The insight that LLMs should write code instead of making sequential tool calls, and that you need a safe interpreter (not a container) to execute it, is what makes code-mode possible.
+
+Samuel and the Pydantic team have a track record of building foundational tools that the whole ecosystem builds on — [Pydantic](https://github.com/pydantic/pydantic), [Pydantic AI](https://github.com/pydantic/pydantic-ai), [Logfire](https://github.com/pydantic/logfire), and now Monty. This project is a Go bridge to their work, and we're grateful they built it.
+
 ## License
 
 MIT
