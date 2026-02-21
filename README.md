@@ -328,7 +328,7 @@ if errors.As(err, &me) {
 ## What Monty Cannot Do
 
 - Class definitions (not yet supported in Monty)
-- Standard library (except `sys`, `typing`, `asyncio`, `dataclasses`, `os`, `pathlib`)
+- `sys`, `typing`, `asyncio`, `dataclasses`, `os`, `pathlib`
 - Third-party libraries
 - `filter()` (use list comprehensions)
 - `float('inf')` / `float('nan')` (JSON serialization limitation)
