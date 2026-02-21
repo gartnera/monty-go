@@ -78,10 +78,10 @@ f"{london['city']}: {london['temp']}°C, {tokyo['city']}: {tokyo['temp']}°C"
     `,
     nil,
     montygo.WithExternalFunc(func(ctx context.Context, call *montygo.FunctionCall) (any, error) {
-        city, _ := call.Args[0].(string)
+        city, _ := call.Args["city"].(string)
         // Your real implementation here — HTTP call, database query, anything.
         return map[string]any{"city": city, "temp": 22}, nil
-    }, "get_weather"),
+    }, montygo.Func("get_weather", "city")),
 )
 // result: "London: 22°C, Tokyo: 22°C"
 ```
@@ -93,15 +93,19 @@ result, err := runner.Execute(ctx, code, nil,
     montygo.WithExternalFunc(func(ctx context.Context, call *montygo.FunctionCall) (any, error) {
         switch call.Name {
         case "search":
-            return doSearch(call.Args, call.Kwargs)
+            return doSearch(call.Args)
         case "calculate":
             return doCalculate(call.Args)
         case "store":
-            return doStore(call.Args, call.Kwargs)
+            return doStore(call.Args)
         default:
             return nil, fmt.Errorf("unknown function: %s", call.Name)
         }
-    }, "search", "calculate", "store"),
+    },
+        montygo.Func("search", "query"),
+        montygo.Func("calculate", "expression"),
+        montygo.Func("store", "key", "value"),
+    ),
 )
 ```
 
@@ -270,10 +274,17 @@ defer runner.Close()
 result, err := runner.Execute(ctx, code, inputs, opts...)
 
 // Options:
-montygo.WithExternalFunc(fn, "name1", "name2")  // register callable functions
+montygo.WithExternalFunc(fn,                     // register callable functions
+    montygo.Func("search", "query", "limit"),    // with named parameters
+    montygo.Func("calculate", "expression"),
+)
 montygo.WithOsCallFunc(fn)                       // handle filesystem/env access
 montygo.WithLimits(montygo.Limits{...})          // resource limits
 montygo.WithPrintFunc(fn)                        // capture print output
+
+// FunctionCall provides named args (positional mapped by param name):
+call.Args["query"].(string)    // access by parameter name
+call.ArgsJSON()                // pre-serialized JSON string
 ```
 
 ### Types
@@ -324,7 +335,7 @@ if errors.As(err, &me) {
 
 ## Tests
 
-96 end-to-end tests covering every testable scenario from Monty's core test suite:
+97 end-to-end tests covering every testable scenario from Monty's core test suite:
 
 ```bash
 make test

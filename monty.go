@@ -63,12 +63,37 @@ func (l Limits) MarshalJSON() ([]byte, error) {
 }
 
 // FunctionCall contains information about an external function call from Python.
+// Args contains all arguments merged into a single map — positional args are
+// mapped to parameter names (registered via FuncDef) and kwargs are merged in.
 type FunctionCall struct {
-	Name       string
-	Args       []any
-	Kwargs     map[string]any
-	CallID     uint32
-	MethodCall bool
+	Name   string
+	Args   map[string]any
+	CallID uint32
+}
+
+// ArgsJSON returns Args serialized as a JSON string, suitable for passing
+// directly to tool handlers that accept JSON argument strings.
+func (fc *FunctionCall) ArgsJSON() string {
+	if len(fc.Args) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(fc.Args)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// FuncDef defines an external Python function with its parameter names.
+// Parameter names enable positional-to-keyword argument mapping in the WASM layer.
+type FuncDef struct {
+	Name   string   `json:"name"`
+	Params []string `json:"params,omitempty"`
+}
+
+// Func creates a FuncDef with the given name and parameter names.
+func Func(name string, params ...string) FuncDef {
+	return FuncDef{Name: name, Params: params}
 }
 
 // OsCall contains information about an OS-level operation from Python.
@@ -93,15 +118,16 @@ type executeConfig struct {
 	osCallFunc   OsCallFunc
 	limits       Limits
 	printFunc    func(string)
-	extFuncNames []string
+	extFuncs     []FuncDef
 }
 
 // WithExternalFunc sets the callback for external function calls.
-// funcNames lists the function names that will be available in the Python code.
-func WithExternalFunc(fn ExternalFunc, funcNames ...string) ExecuteOption {
+// Each FuncDef declares a function name and its parameter names (for
+// positional-to-keyword argument mapping).
+func WithExternalFunc(fn ExternalFunc, funcs ...FuncDef) ExecuteOption {
 	return func(c *executeConfig) {
 		c.externalFunc = fn
-		c.extFuncNames = funcNames
+		c.extFuncs = funcs
 	}
 }
 

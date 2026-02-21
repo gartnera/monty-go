@@ -153,12 +153,47 @@ fn monty_kwargs_to_json(kwargs: &[(MontyObject, MontyObject)]) -> JsonValue {
     JsonValue::Object(map)
 }
 
+/// Merge positional args and kwargs into a single JSON object.
+/// Positional args are mapped to parameter names by index.
+fn merge_args(
+    func_name: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    param_registry: &HashMap<String, Vec<String>>,
+) -> JsonValue {
+    let mut map = serde_json::Map::new();
+    // Map positional args to parameter names.
+    if let Some(param_names) = param_registry.get(func_name) {
+        for (i, arg) in args.iter().enumerate() {
+            if i < param_names.len() {
+                map.insert(param_names[i].clone(), monty_to_json(arg));
+            }
+        }
+    }
+    // Merge kwargs (overrides positional — Python semantics).
+    for (k, v) in kwargs {
+        if let MontyObject::String(key) = k {
+            map.insert(key.clone(), monty_to_json(v));
+        }
+    }
+    JsonValue::Object(map)
+}
+
+/// External function definition with parameter names.
+#[derive(Deserialize)]
+struct ExtFuncDef {
+    name: String,
+    #[serde(default)]
+    params: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static RESULT_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static PARAM_REGISTRY: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
 
 struct State {
     next_id: u32,
@@ -194,6 +229,17 @@ where
     let mut guard = STATE.lock().unwrap();
     let state = guard.get_or_insert_with(State::new);
     f(state)
+}
+
+fn with_param_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&HashMap<String, Vec<String>>) -> R,
+{
+    let guard = PARAM_REGISTRY.lock().unwrap();
+    static EMPTY: std::sync::LazyLock<HashMap<String, Vec<String>>> =
+        std::sync::LazyLock::new(HashMap::new);
+    let registry = guard.as_ref().unwrap_or(&EMPTY);
+    f(registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +330,11 @@ impl PrintWriterCallback for CollectPrintWriter {
 // RunProgress -> ProgressResult conversion
 // ---------------------------------------------------------------------------
 
-fn progress_to_result(progress: RunProgress<LimitedTracker>, print_output: String) -> ProgressResult {
+fn progress_to_result(
+    progress: RunProgress<LimitedTracker>,
+    print_output: String,
+    param_registry: &HashMap<String, Vec<String>>,
+) -> ProgressResult {
     let print_out = if print_output.is_empty() {
         None
     } else {
@@ -311,11 +361,10 @@ fn progress_to_result(progress: RunProgress<LimitedTracker>, print_output: Strin
             args,
             kwargs,
             call_id,
-            method_call,
             state,
+            ..
         } => {
-            let args_json = monty_args_to_json(&args);
-            let kwargs_json = monty_kwargs_to_json(&kwargs);
+            let merged = merge_args(&function_name, &args, &kwargs, param_registry);
             let handle = with_state(|s| {
                 let h = s.next_handle();
                 s.snapshots.insert(h, SnapshotState::Sync(state));
@@ -327,10 +376,10 @@ fn progress_to_result(progress: RunProgress<LimitedTracker>, print_output: Strin
                 snapshot_handle: Some(handle),
                 function_name: Some(function_name),
                 os_function: None,
-                args: Some(args_json),
-                kwargs: Some(kwargs_json),
+                args: Some(merged),
+                kwargs: None,
                 call_id: Some(call_id),
-                method_call: Some(method_call),
+                method_call: None,
                 pending_call_ids: None,
                 error: None,
                 print_output: print_out,
@@ -535,13 +584,24 @@ pub extern "C" fn monty_compile(
         serde_json::from_str(&input_names_json).unwrap_or_default()
     };
 
-    let ext_funcs: Vec<String> = if ext_funcs_json.is_empty() {
+    let ext_func_defs: Vec<ExtFuncDef> = if ext_funcs_json.is_empty() {
         vec![]
     } else {
         serde_json::from_str(&ext_funcs_json).unwrap_or_default()
     };
 
-    match MontyRun::new(code, "script.py", input_names, ext_funcs) {
+    // Extract function names for MontyRun and store param registry.
+    let ext_func_names: Vec<String> = ext_func_defs.iter().map(|f| f.name.clone()).collect();
+    {
+        let mut registry_guard = PARAM_REGISTRY.lock().unwrap();
+        let registry = registry_guard.get_or_insert_with(HashMap::new);
+        registry.clear();
+        for def in &ext_func_defs {
+            registry.insert(def.name.clone(), def.params.clone());
+        }
+    }
+
+    match MontyRun::new(code, "script.py", input_names, ext_func_names) {
         Ok(runner) => with_state(|s| {
             let handle = s.next_handle();
             s.runners.insert(handle, runner);
@@ -610,7 +670,7 @@ pub extern "C" fn monty_start(
     match runner.start(inputs, tracker, &mut pw) {
         Ok(progress) => {
             let print_output = print_writer.buf.clone();
-            let result = progress_to_result(progress, print_output);
+            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
             let status = match result.status {
                 "complete" => 1,
                 "function_call" => 2,
@@ -654,7 +714,7 @@ pub extern "C" fn monty_resume(
     match snapshot.run(ExternalResult::Return(return_value), &mut pw) {
         Ok(progress) => {
             let print_output = print_writer.buf.clone();
-            let result = progress_to_result(progress, print_output);
+            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
             let status = match result.status {
                 "complete" => 1,
                 "function_call" => 2,
@@ -711,7 +771,7 @@ pub extern "C" fn monty_resume_futures(
     match snapshot.resume(results, &mut pw) {
         Ok(progress) => {
             let print_output = print_writer.buf.clone();
-            let result = progress_to_result(progress, print_output);
+            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
             let status = match result.status {
                 "complete" => 1,
                 "function_call" => 2,

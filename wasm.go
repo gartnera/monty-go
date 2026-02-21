@@ -159,10 +159,9 @@ type progressResult struct {
 	SnapshotHandle *uint32          `json:"snapshot_handle,omitempty"`
 	FunctionName   *string          `json:"function_name,omitempty"`
 	OsFunction     *string          `json:"os_function,omitempty"`
-	Args           *json.RawMessage  `json:"args,omitempty"`
-	Kwargs         *json.RawMessage  `json:"kwargs,omitempty"`
+	Args           *json.RawMessage `json:"args,omitempty"`
+	Kwargs         *json.RawMessage `json:"kwargs,omitempty"`
 	CallID         *uint32          `json:"call_id,omitempty"`
-	MethodCall     *bool            `json:"method_call,omitempty"`
 	PendingCallIDs []uint32         `json:"pending_call_ids,omitempty"`
 	Error          *string          `json:"error,omitempty"`
 	PrintOutput    *string          `json:"print_output,omitempty"`
@@ -191,7 +190,7 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 	}
 	defer inst.freeWasmMem(ctx, inputNamesPtr, inputNamesLen)
 
-	extFuncNamesPtr, extFuncNamesLen, err := inst.writeJSON(ctx, cfg.extFuncNames)
+	extFuncNamesPtr, extFuncNamesLen, err := inst.writeJSON(ctx, cfg.extFuncs)
 	if err != nil {
 		return nil, err
 	}
@@ -280,11 +279,9 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			}
 
 			call := &FunctionCall{
-				Name:       deref(progress.FunctionName),
-				Args:       rawArrayToAny(progress.Args),
-				Kwargs:     rawObjectToMap(progress.Kwargs),
-				CallID:     derefU32(progress.CallID),
-				MethodCall: derefBool(progress.MethodCall),
+				Name:   deref(progress.FunctionName),
+				Args:   rawObjectToMap(progress.Args),
+				CallID: derefU32(progress.CallID),
 			}
 
 			returnVal, fnErr := cfg.externalFunc(ctx, call)
@@ -377,13 +374,6 @@ func deref(s *string) string {
 func derefU32(v *uint32) uint32 {
 	if v == nil {
 		return 0
-	}
-	return *v
-}
-
-func derefBool(v *bool) bool {
-	if v == nil {
-		return false
 	}
 	return *v
 }

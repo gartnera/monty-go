@@ -2,6 +2,7 @@ package montygo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -973,7 +974,7 @@ func TestExtFuncNoArgs(t *testing.T) {
 				return nil, fmt.Errorf("expected 0 args, got %d", len(call.Args))
 			}
 			return "called", nil
-		}, "noop"))
+		}, Func("noop")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -984,12 +985,12 @@ func TestExtFuncNoArgs(t *testing.T) {
 
 func TestExtFuncPositionalArgs(t *testing.T) {
 	r := newRunner(t)
-	var gotArgs []any
-	result, err := r.Execute(context.Background(), "func(1, 2, 3)", nil,
+	var gotArgs map[string]any
+	result, err := r.Execute(context.Background(), "fn(1, 2, 3)", nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			gotArgs = call.Args
 			return "ok", nil
-		}, "func"))
+		}, Func("fn", "a", "b", "c")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -999,77 +1000,76 @@ func TestExtFuncPositionalArgs(t *testing.T) {
 	if len(gotArgs) != 3 {
 		t.Fatalf("expected 3 args, got %d: %v", len(gotArgs), gotArgs)
 	}
-	if gotArgs[0] != float64(1) || gotArgs[1] != float64(2) || gotArgs[2] != float64(3) {
-		t.Fatalf("expected [1,2,3], got %v", gotArgs)
+	if gotArgs["a"] != float64(1) || gotArgs["b"] != float64(2) || gotArgs["c"] != float64(3) {
+		t.Fatalf("expected {a:1, b:2, c:3}, got %v", gotArgs)
 	}
 }
 
 func TestExtFuncKwargsOnly(t *testing.T) {
 	r := newRunner(t)
-	var gotKwargs map[string]any
-	result, err := r.Execute(context.Background(), `func(a=1, b="two")`, nil,
+	var gotArgs map[string]any
+	result, err := r.Execute(context.Background(), `fn(a=1, b="two")`, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			gotKwargs = call.Kwargs
+			gotArgs = call.Args
 			return "ok", nil
-		}, "func"))
+		}, Func("fn", "a", "b")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
 	if result != "ok" {
 		t.Fatalf("expected 'ok', got %v", result)
 	}
-	if gotKwargs["a"] != float64(1) || gotKwargs["b"] != "two" {
-		t.Fatalf("expected {a:1, b:'two'}, got %v", gotKwargs)
+	if gotArgs["a"] != float64(1) || gotArgs["b"] != "two" {
+		t.Fatalf("expected {a:1, b:'two'}, got %v", gotArgs)
 	}
 }
 
 func TestExtFuncMixedArgsKwargs(t *testing.T) {
 	r := newRunner(t)
-	var gotArgs []any
-	var gotKwargs map[string]any
-	_, err := r.Execute(context.Background(), `func(1, 2, x="hello", y=True)`, nil,
+	var gotArgs map[string]any
+	_, err := r.Execute(context.Background(), `fn(1, 2, x="hello", y=True)`, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			gotArgs = call.Args
-			gotKwargs = call.Kwargs
 			return nil, nil
-		}, "func"))
+		}, Func("fn", "a", "b")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
-	if len(gotArgs) != 2 || gotArgs[0] != float64(1) || gotArgs[1] != float64(2) {
-		t.Fatalf("expected args [1,2], got %v", gotArgs)
+	// Positional args mapped to "a" and "b", kwargs "x" and "y" merged in.
+	if gotArgs["a"] != float64(1) || gotArgs["b"] != float64(2) {
+		t.Fatalf("expected a=1, b=2, got %v", gotArgs)
 	}
-	if gotKwargs["x"] != "hello" || gotKwargs["y"] != true {
-		t.Fatalf("expected kwargs {x:'hello', y:true}, got %v", gotKwargs)
+	if gotArgs["x"] != "hello" || gotArgs["y"] != true {
+		t.Fatalf("expected x='hello', y=true, got %v", gotArgs)
 	}
 }
 
 func TestExtFuncComplexTypes(t *testing.T) {
 	r := newRunner(t)
-	var gotArgs []any
-	_, err := r.Execute(context.Background(), `func([1, 2], {"key": "value"})`, nil,
+	var gotArgs map[string]any
+	_, err := r.Execute(context.Background(), `fn([1, 2], {"key": "value"})`, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			gotArgs = call.Args
 			return nil, nil
-		}, "func"))
+		}, Func("fn", "list_arg", "dict_arg")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
 	if len(gotArgs) != 2 {
 		t.Fatalf("expected 2 args, got %d", len(gotArgs))
 	}
-	// First arg should be a list.
-	list, ok := gotArgs[0].([]any)
+	// First positional arg mapped to "list_arg".
+	list, ok := gotArgs["list_arg"].([]any)
 	if !ok {
-		t.Fatalf("expected []any for first arg, got %T", gotArgs[0])
+		t.Fatalf("expected []any for list_arg, got %T", gotArgs["list_arg"])
 	}
 	if len(list) != 2 {
 		t.Fatalf("expected list of 2, got %v", list)
 	}
-	// Second arg should be a dict.
-	dict, ok := gotArgs[1].(map[string]any)
+	// Second positional arg mapped to "dict_arg".
+	dict, ok := gotArgs["dict_arg"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected map for second arg, got %T", gotArgs[1])
+		t.Fatalf("expected map for dict_arg, got %T", gotArgs["dict_arg"])
 	}
 	if dict["key"] != "value" {
 		t.Fatalf("expected key='value', got %v", dict)
@@ -1081,7 +1081,7 @@ func TestExtFuncReturnsNone(t *testing.T) {
 	result, err := r.Execute(context.Background(), "do_nothing()", nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			return nil, nil
-		}, "do_nothing"))
+		}, Func("do_nothing")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1098,7 +1098,7 @@ func TestExtFuncReturnsComplexType(t *testing.T) {
 				"a": []any{1, 2, 3},
 				"b": map[string]any{"nested": true},
 			}, nil
-		}, "get_data"))
+		}, Func("get_data")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1120,8 +1120,8 @@ func TestExtFuncMultipleFunctions(t *testing.T) {
 	r := newRunner(t)
 	result, err := r.Execute(context.Background(), "add(1, 2) + mul(3, 4)", nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			a, _ := call.Args[0].(float64)
-			b, _ := call.Args[1].(float64)
+			a, _ := call.Args["a"].(float64)
+			b, _ := call.Args["b"].(float64)
 			switch call.Name {
 			case "add":
 				return a + b, nil
@@ -1130,7 +1130,7 @@ func TestExtFuncMultipleFunctions(t *testing.T) {
 			default:
 				return nil, fmt.Errorf("unknown function: %s", call.Name)
 			}
-		}, "add", "mul"))
+		}, Func("add", "a", "b"), Func("mul", "a", "b")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1146,7 +1146,7 @@ func TestExtFuncCalledMultipleTimes(t *testing.T) {
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			callCount++
 			return callCount, nil
-		}, "counter"))
+		}, Func("counter")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1162,9 +1162,9 @@ func TestExtFuncWithInput(t *testing.T) {
 	r := newRunner(t)
 	result, err := r.Execute(context.Background(), "process(x)", map[string]any{"x": 5},
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			v, _ := call.Args[0].(float64)
+			v, _ := call.Args["val"].(float64)
 			return v * 10, nil
-		}, "process"))
+		}, Func("process", "val")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1189,9 +1189,9 @@ c
 `
 	result, err := r.Execute(context.Background(), code, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			v, _ := call.Args[0].(float64)
+			v, _ := call.Args["n"].(float64)
 			return v + 1, nil
-		}, "step"))
+		}, Func("step", "n")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1204,9 +1204,9 @@ func TestExtFuncUsedInExpression(t *testing.T) {
 	r := newRunner(t)
 	result, err := r.Execute(context.Background(), "1 + double(5) + 2", nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			v, _ := call.Args[0].(float64)
+			v, _ := call.Args["n"].(float64)
 			return v * 2, nil
-		}, "double"))
+		}, Func("double", "n")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1226,9 +1226,9 @@ result
 `
 	result, err := r.Execute(context.Background(), code, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			v, _ := call.Args[0].(float64)
+			v, _ := call.Args["n"].(float64)
 			return v > 5, nil
-		}, "check"))
+		}, Func("check", "n")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1247,9 +1247,9 @@ total
 `
 	result, err := r.Execute(context.Background(), code, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
-			v, _ := call.Args[0].(float64)
+			v, _ := call.Args["n"].(float64)
 			return v * v, nil
-		}, "transform"))
+		}, Func("transform", "n")))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -1271,7 +1271,7 @@ result
 	result, err := r.Execute(context.Background(), code, nil,
 		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
 			return nil, fmt.Errorf("bad value")
-		}, "fail"))
+		}, Func("fail")))
 	// Note: our current implementation wraps external function errors, which may
 	// not produce a catchable ValueError inside Python. This tests the boundary.
 	if err != nil {
@@ -1281,6 +1281,31 @@ result
 	}
 	if result != true {
 		t.Fatalf("expected true, got %v", result)
+	}
+}
+
+func TestExtFuncArgsJSON(t *testing.T) {
+	r := newRunner(t)
+	var gotJSON string
+	_, err := r.Execute(context.Background(), `fn(query="test", limit=10)`, nil,
+		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
+			gotJSON = call.ArgsJSON()
+			return "ok", nil
+		}, Func("fn", "query", "limit")))
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	// Verify ArgsJSON produces valid JSON with correct keys.
+	if gotJSON == "" || gotJSON == "{}" {
+		t.Fatalf("expected non-empty ArgsJSON, got %q", gotJSON)
+	}
+	// Parse it back to verify.
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(gotJSON), &parsed); err != nil {
+		t.Fatalf("ArgsJSON is not valid JSON: %v", err)
+	}
+	if parsed["query"] != "test" || parsed["limit"] != float64(10) {
+		t.Fatalf("expected {query:test, limit:10}, got %v", parsed)
 	}
 }
 
