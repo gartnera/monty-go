@@ -226,7 +226,7 @@ Why Gollem + monty-go:
 
 Gollem gives you compile-time type safety, structured output, guardrails, cost tracking, middleware, and multi-provider support. monty-go gives you secure embedded Python execution. Together, your agents do more work per model call.
 
-👉 **[github.com/fugue-labs/gollem](https://github.com/fugue-labs/gollem)** — The production agent framework for Go.
+**[github.com/fugue-labs/gollem](https://github.com/fugue-labs/gollem)** — The production agent framework for Go.
 
 ## How It Works
 
@@ -242,9 +242,9 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (2.9 MB)     │  │  ◄── go:embed      │
-│  │  │  Monty Python Interpreter│  │                    │
-│  │  │  compiled to wasm32-wasi │  │                    │
+│  │  │  monty.wasm (2.9 MB)      │  │  ◄── go:embed      │
+│  │  │  Monty Python Interpreter │  │                    │
+│  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
 │  │             │                   │                    │
 │  │     pause on external call      │                    │
