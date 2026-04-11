@@ -12,8 +12,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use monty::{
-    DictPairs, ExternalResult, FutureSnapshot, LimitedTracker, MontyException, MontyObject,
-    MontyRun, PrintWriter, PrintWriterCallback, ResourceLimits, RunProgress, Snapshot,
+    DictPairs, ExcType, ExtFunctionResult, FunctionCall, LimitedTracker, MontyException,
+    MontyObject, MontyRun, NameLookupResult, OsCall, PrintWriter, PrintWriterCallback,
+    ResolveFutures, ResourceLimits, RunProgress,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -202,8 +203,9 @@ struct State {
 }
 
 enum SnapshotState {
-    Sync(Snapshot<LimitedTracker>),
-    Future(FutureSnapshot<LimitedTracker>),
+    FunctionCall(FunctionCall<LimitedTracker>),
+    OsCall(OsCall<LimitedTracker>),
+    ResolveFutures(ResolveFutures<LimitedTracker>),
 }
 
 impl State {
@@ -356,18 +358,14 @@ fn progress_to_result(
             pending_call_ids: None,
             error: None,
         },
-        RunProgress::FunctionCall {
-            function_name,
-            args,
-            kwargs,
-            call_id,
-            state,
-            ..
-        } => {
-            let merged = merge_args(&function_name, &args, &kwargs, param_registry);
+        RunProgress::FunctionCall(call) => {
+            let merged = merge_args(&call.function_name, &call.args, &call.kwargs, param_registry);
+            let function_name = call.function_name.clone();
+            let call_id = call.call_id;
+            let method_call = call.method_call;
             let handle = with_state(|s| {
                 let h = s.next_handle();
-                s.snapshots.insert(h, SnapshotState::Sync(state));
+                s.snapshots.insert(h, SnapshotState::FunctionCall(call));
                 h
             });
             ProgressResult {
@@ -379,24 +377,20 @@ fn progress_to_result(
                 args: Some(merged),
                 kwargs: None,
                 call_id: Some(call_id),
-                method_call: None,
+                method_call: Some(method_call),
                 pending_call_ids: None,
                 error: None,
                 print_output: print_out,
             }
         }
-        RunProgress::OsCall {
-            function,
-            args,
-            kwargs,
-            call_id,
-            state,
-        } => {
-            let args_json = monty_args_to_json(&args);
-            let kwargs_json = monty_kwargs_to_json(&kwargs);
+        RunProgress::OsCall(call) => {
+            let args_json = monty_args_to_json(&call.args);
+            let kwargs_json = monty_kwargs_to_json(&call.kwargs);
+            let function_str = call.function.to_string();
+            let call_id = call.call_id;
             let handle = with_state(|s| {
                 let h = s.next_handle();
-                s.snapshots.insert(h, SnapshotState::Sync(state));
+                s.snapshots.insert(h, SnapshotState::OsCall(call));
                 h
             });
             ProgressResult {
@@ -404,7 +398,7 @@ fn progress_to_result(
                 value: None,
                 snapshot_handle: Some(handle),
                 function_name: None,
-                os_function: Some(function.to_string()),
+                os_function: Some(function_str),
                 args: Some(args_json),
                 kwargs: Some(kwargs_json),
                 call_id: Some(call_id),
@@ -418,7 +412,7 @@ fn progress_to_result(
             let pending = state.pending_call_ids().to_vec();
             let handle = with_state(|s| {
                 let h = s.next_handle();
-                s.snapshots.insert(h, SnapshotState::Future(state));
+                s.snapshots.insert(h, SnapshotState::ResolveFutures(state));
                 h
             });
             ProgressResult {
@@ -434,6 +428,82 @@ fn progress_to_result(
                 pending_call_ids: Some(pending),
                 error: None,
                 print_output: print_out,
+            }
+        }
+        // NameLookup should be resolved internally by `drive_progress` before
+        // reaching this point. If one slips through we treat it as an error.
+        RunProgress::NameLookup(lookup) => ProgressResult {
+            status: "error",
+            value: None,
+            snapshot_handle: None,
+            function_name: None,
+            os_function: None,
+            args: None,
+            kwargs: None,
+            call_id: None,
+            method_call: None,
+            pending_call_ids: None,
+            error: Some(format!(
+                "internal error: unhandled name lookup for '{}'",
+                lookup.name
+            )),
+            print_output: print_out,
+        },
+    }
+}
+
+/// Drives a RunProgress chain, auto-resolving NameLookup events against the
+/// registered external function set. Returns a `(status_code, ProgressResult)`
+/// pair suitable for the WASM wire format. NameLookup events whose name is
+/// present in `param_registry` resolve to a `MontyObject::Function`; unknown
+/// names resolve to `Undefined`, which the VM surfaces as `NameError`.
+fn drive_progress(
+    mut result: Result<RunProgress<LimitedTracker>, MontyException>,
+    print_writer: &mut CollectPrintWriter,
+    param_registry: &HashMap<String, Vec<String>>,
+) -> (u32, ProgressResult) {
+    loop {
+        match result {
+            Ok(RunProgress::NameLookup(lookup)) => {
+                let nlr = if param_registry.contains_key(&lookup.name) {
+                    NameLookupResult::Value(MontyObject::Function {
+                        name: lookup.name.clone(),
+                        docstring: None,
+                    })
+                } else {
+                    NameLookupResult::Undefined
+                };
+                let pw = PrintWriter::Callback(print_writer);
+                result = lookup.resume(nlr, pw);
+            }
+            // A call to a name that's not a registered external function is a
+            // NameError — monty's bytecode compiler emits `LoadGlobalCallable`
+            // / `LoadLocalCallable` which bypass `NameLookup` and yield a
+            // `FunctionCall` directly, so we have to catch the undeclared case
+            // here and auto-resume with a NameError exception.
+            Ok(RunProgress::FunctionCall(call)) if !param_registry.contains_key(&call.function_name) => {
+                let exc = MontyException::new(
+                    ExcType::NameError,
+                    Some(format!("name '{}' is not defined", call.function_name)),
+                );
+                let pw = PrintWriter::Callback(print_writer);
+                result = call.resume(ExtFunctionResult::Error(exc), pw);
+            }
+            Ok(progress) => {
+                let print_output = print_writer.buf.clone();
+                let pr = progress_to_result(progress, print_output, param_registry);
+                let status = match pr.status {
+                    "complete" => 1,
+                    "function_call" => 2,
+                    "os_call" => 3,
+                    "resolve_futures" => 4,
+                    _ => 0,
+                };
+                return (status, pr);
+            }
+            Err(e) => {
+                let print_output = print_writer.buf.clone();
+                return (0, error_result(&e, print_output));
             }
         }
     }
@@ -519,7 +589,7 @@ pub extern "C" fn monty_result_read(buf_ptr: u32, buf_cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn monty_check() -> u32 {
     let result = std::panic::catch_unwind(|| {
-        let runner = MontyRun::new("x + 1".to_owned(), "check.py", vec!["x".to_owned()], vec![])
+        let runner = MontyRun::new("x + 1".to_owned(), "check.py", vec!["x".to_owned()])
             .ok()?;
         let result = runner.run_no_limits(vec![MontyObject::Int(41)]).ok()?;
         match result {
@@ -590,8 +660,10 @@ pub extern "C" fn monty_compile(
         serde_json::from_str(&ext_funcs_json).unwrap_or_default()
     };
 
-    // Extract function names for MontyRun and store param registry.
-    let ext_func_names: Vec<String> = ext_func_defs.iter().map(|f| f.name.clone()).collect();
+    // Store the external function registry. Names double as the "known
+    // externals" set used to resolve NameLookup events — monty >= 0.0.8
+    // auto-detects external functions at call sites and yields a NameLookup
+    // that the host resolves on demand.
     {
         let mut registry_guard = PARAM_REGISTRY.lock().unwrap();
         let registry = registry_guard.get_or_insert_with(HashMap::new);
@@ -601,7 +673,7 @@ pub extern "C" fn monty_compile(
         }
     }
 
-    match MontyRun::new(code, "script.py", input_names, ext_func_names) {
+    match MontyRun::new(code, "script.py", input_names) {
         Ok(runner) => with_state(|s| {
             let handle = s.next_handle();
             s.runners.insert(handle, runner);
@@ -665,28 +737,15 @@ pub extern "C" fn monty_start(
     let tracker = LimitedTracker::new(resource_limits);
 
     let mut print_writer = CollectPrintWriter::new();
-    let mut pw = PrintWriter::Callback(&mut print_writer);
+    let initial = {
+        let pw = PrintWriter::Callback(&mut print_writer);
+        runner.start(inputs, tracker, pw)
+    };
 
-    match runner.start(inputs, tracker, &mut pw) {
-        Ok(progress) => {
-            let print_output = print_writer.buf.clone();
-            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
-            let status = match result.status {
-                "complete" => 1,
-                "function_call" => 2,
-                "os_call" => 3,
-                "resolve_futures" => 4,
-                _ => 0,
-            };
-            set_result_json(&result);
-            status
-        }
-        Err(e) => {
-            let print_output = print_writer.buf.clone();
-            set_result_json(&error_result(&e, print_output));
-            0
-        }
-    }
+    let (status, result) =
+        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    set_result_json(&result);
+    status
 }
 
 /// Resume execution after a function call or OS call.
@@ -697,40 +756,34 @@ pub extern "C" fn monty_resume(
     return_value_len: u32,
 ) -> u32 {
     let snapshot = with_state(|s| s.snapshots.remove(&snapshot_handle));
-    let snapshot = match snapshot {
-        Some(SnapshotState::Sync(s)) => s,
-        _ => {
-            set_result_json(&str_error_result("invalid snapshot handle", String::new()));
-            return 0;
-        }
-    };
 
     let return_json = unsafe { read_str(return_value_ptr, return_value_len) };
     let return_value = parse_return_value(&return_json);
 
     let mut print_writer = CollectPrintWriter::new();
-    let mut pw = PrintWriter::Callback(&mut print_writer);
 
-    match snapshot.run(ExternalResult::Return(return_value), &mut pw) {
-        Ok(progress) => {
-            let print_output = print_writer.buf.clone();
-            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
-            let status = match result.status {
-                "complete" => 1,
-                "function_call" => 2,
-                "os_call" => 3,
-                "resolve_futures" => 4,
-                _ => 0,
-            };
-            set_result_json(&result);
-            status
+    // Dispatch on the stored variant. Each per-variant struct (FunctionCall,
+    // OsCall) has its own `resume()` method that consumes self.
+    let initial = {
+        let pw = PrintWriter::Callback(&mut print_writer);
+        match snapshot {
+            Some(SnapshotState::FunctionCall(call)) => {
+                call.resume(ExtFunctionResult::Return(return_value), pw)
+            }
+            Some(SnapshotState::OsCall(call)) => {
+                call.resume(ExtFunctionResult::Return(return_value), pw)
+            }
+            _ => {
+                set_result_json(&str_error_result("invalid snapshot handle", String::new()));
+                return 0;
+            }
         }
-        Err(e) => {
-            let print_output = print_writer.buf.clone();
-            set_result_json(&error_result(&e, print_output));
-            0
-        }
-    }
+    };
+
+    let (status, result) =
+        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    set_result_json(&result);
+    status
 }
 
 /// Resume execution after resolving futures.
@@ -742,7 +795,7 @@ pub extern "C" fn monty_resume_futures(
 ) -> u32 {
     let snapshot = with_state(|s| s.snapshots.remove(&snapshot_handle));
     let snapshot = match snapshot {
-        Some(SnapshotState::Future(s)) => s,
+        Some(SnapshotState::ResolveFutures(s)) => s,
         _ => {
             set_result_json(&str_error_result(
                 "invalid future snapshot handle",
@@ -760,34 +813,21 @@ pub extern "C" fn monty_resume_futures(
         serde_json::from_str(&results_json).unwrap_or_default()
     };
 
-    let results: Vec<(u32, ExternalResult)> = pairs
+    let results: Vec<(u32, ExtFunctionResult)> = pairs
         .into_iter()
-        .map(|(id, val)| (id, ExternalResult::Return(json_to_monty(&val))))
+        .map(|(id, val)| (id, ExtFunctionResult::Return(json_to_monty(&val))))
         .collect();
 
     let mut print_writer = CollectPrintWriter::new();
-    let mut pw = PrintWriter::Callback(&mut print_writer);
+    let initial = {
+        let pw = PrintWriter::Callback(&mut print_writer);
+        snapshot.resume(results, pw)
+    };
 
-    match snapshot.resume(results, &mut pw) {
-        Ok(progress) => {
-            let print_output = print_writer.buf.clone();
-            let result = with_param_registry(|reg| progress_to_result(progress, print_output, reg));
-            let status = match result.status {
-                "complete" => 1,
-                "function_call" => 2,
-                "os_call" => 3,
-                "resolve_futures" => 4,
-                _ => 0,
-            };
-            set_result_json(&result);
-            status
-        }
-        Err(e) => {
-            let print_output = print_writer.buf.clone();
-            set_result_json(&error_result(&e, print_output));
-            0
-        }
-    }
+    let (status, result) =
+        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    set_result_json(&result);
+    status
 }
 
 /// Free a runner handle.

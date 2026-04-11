@@ -314,24 +314,32 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
+Tracks upstream [Monty v0.0.11](https://github.com/pydantic/monty/releases/tag/v0.0.11).
+
 - Arithmetic, string operations, f-strings, slicing
 - Functions, lambdas, closures, generators
 - `for`/`while` loops, `if`/`elif`/`else`, `break`/`continue`
 - `try`/`except`/`finally`/`else`, `raise`, exception hierarchy
-- List/dict/set comprehensions
-- `range`, `len`, `sum`, `min`, `max`, `sorted`, `reversed`, `enumerate`, `zip`, `map`, `all`, `any`
+- List/dict/set comprehensions, dict/set view operators
+- `range`, `len`, `sum`, `min`, `max`, `sorted`, `reversed`, `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `getattr`
 - `isinstance`, `type`, `int()`, `float()`, `str()`, `bool()`, `abs()`
 - `print()` with `sep` and `end` kwargs
+- PEP 448 generalized unpacking (`*args`, `**kwargs` in calls, literals, etc.)
+- Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
+- Tuple comparison (`<`, `>`, `<=`, `>=`)
+- Multi-module imports (`import a, b, c`)
+- Stdlib modules: `math` (all functions), `re`, `datetime`, `json`, and `sys`/`typing`/`asyncio` subsets
 - `import os`, `from pathlib import Path` (routed through OsCallFunc)
+- Dataclass *instances* flow through external function calls (args, returns, and method calls surface with `method_call=true`)
 - Resource limits: time, memory, allocations, recursion depth
 
 ## What Monty Cannot Do
 
-- Class definitions (not yet supported in Monty)
-- `sys`, `typing`, `asyncio`, `dataclasses`, `os`, `pathlib`
-- Third-party libraries
-- `filter()` (use list comprehensions)
-- `float('inf')` / `float('nan')` (JSON serialization limitation)
+- Class definitions (only dataclass instances via external I/O; upstream Monty flags class `def` as "coming soon")
+- `match` statements (coming soon upstream)
+- Context managers (`with ...`)
+- Rest of stdlib and all third-party libraries
+- `float('inf')` / `float('nan')` (JSON serialization limitation in this bridge)
 
 ## Tests
 
