@@ -234,6 +234,17 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 	status := uint32(startResult[0])
 
 	// 3. Loop on progress.
+	//
+	// monty stores max_suspensions but does not enforce it — the host counts
+	// the suspensions it services. It backstops sandboxed code that loops on
+	// host calls, which never advances max_duration because the VM clock only
+	// runs while the VM does.
+	maxSuspensions := cfg.limits.MaxSuspensions
+	if maxSuspensions == 0 {
+		maxSuspensions = DefaultMaxSuspensions
+	}
+	var suspensions uint64
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -273,6 +284,11 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			return nil, &MontyError{Message: errMsg}
 
 		case statusFunctionCall:
+			suspensions++
+			if suspensions > maxSuspensions {
+				return nil, &MontyError{Message: fmt.Sprintf(
+					"exceeded max suspensions (%d host calls)", maxSuspensions)}
+			}
 			if cfg.externalFunc == nil {
 				return nil, fmt.Errorf("montygo: external function %q called but no handler configured",
 					deref(progress.FunctionName))
@@ -295,6 +311,11 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			}
 
 		case statusOsCall:
+			suspensions++
+			if suspensions > maxSuspensions {
+				return nil, &MontyError{Message: fmt.Sprintf(
+					"exceeded max suspensions (%d host calls)", maxSuspensions)}
+			}
 			if cfg.osCallFunc == nil {
 				return nil, fmt.Errorf("montygo: OS call %q but no handler configured",
 					deref(progress.OsFunction))

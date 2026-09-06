@@ -11,12 +11,19 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use monty::{
-    DictPairs, ExcType, ExtFunctionResult, FunctionCall, LimitedTracker, MontyException,
-    MontyObject, MontyRun, NameLookupResult, OsCall, PrintWriter, PrintWriterCallback,
-    ResolveFutures, ResourceLimits, RunProgress,
+use monty::{FunctionCall, MontyRun, OsCall, ResolveFutures, RunProgress};
+use monty_types::{
+    CompileOptions, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS, DictPairs, ExcType,
+    ExtFunctionResult, MontyException, MontyObject, NameLookupResult, PrintWriter,
+    PrintWriterCallback, ResourceLimits, ResourceTracker,
 };
 use serde::{Deserialize, Serialize};
+
+/// monty enforces `max_memory` in the global allocator, so the limit only
+/// applies when this allocator is installed and armed via
+/// `monty_alloc::set_limit` before each run.
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 use serde_json::Value as JsonValue;
 
 // ---------------------------------------------------------------------------
@@ -85,22 +92,16 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
             }
             JsonValue::Object(map)
         }
-        MontyObject::Dataclass {
-            name,
-            field_names,
-            attrs,
-            ..
-        } => {
+        MontyObject::ClassInstance(instance) => {
             let mut map = serde_json::Map::new();
-            map.insert("__type__".to_owned(), JsonValue::String(name.clone()));
-            for field_name in field_names {
-                for (k, v) in attrs {
-                    if let MontyObject::String(key) = k {
-                        if key == field_name {
-                            map.insert(field_name.clone(), monty_to_json(v));
-                            break;
-                        }
-                    }
+            map.insert(
+                "__type__".to_owned(),
+                JsonValue::String(instance.class_type.name.clone()),
+            );
+            // attrs preserve declaration order, so no field-name list is needed.
+            for (k, v) in instance.attrs.iter() {
+                if let MontyObject::String(key) = k {
+                    map.insert(key.clone(), monty_to_json(v));
                 }
             }
             JsonValue::Object(map)
@@ -203,9 +204,9 @@ struct State {
 }
 
 enum SnapshotState {
-    FunctionCall(FunctionCall<LimitedTracker>),
-    OsCall(OsCall<LimitedTracker>),
-    ResolveFutures(ResolveFutures<LimitedTracker>),
+    FunctionCall(FunctionCall),
+    OsCall(OsCall),
+    ResolveFutures(ResolveFutures),
 }
 
 impl State {
@@ -290,10 +291,15 @@ struct ProgressResult {
     print_output: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct LimitsInput {
+    /// Accepted for wire compatibility; monty dropped allocation counting in
+    /// favour of `max_memory` and `max_suspensions`.
     #[serde(default)]
+    #[allow(dead_code)]
     max_allocations: Option<usize>,
+    #[serde(default)]
+    max_suspensions: Option<usize>,
     #[serde(default)]
     max_duration_ms: Option<u64>,
     #[serde(default)]
@@ -333,7 +339,7 @@ impl PrintWriterCallback for CollectPrintWriter {
 // ---------------------------------------------------------------------------
 
 fn progress_to_result(
-    progress: RunProgress<LimitedTracker>,
+    progress: RunProgress,
     print_output: String,
     param_registry: &HashMap<String, Vec<String>>,
 ) -> ProgressResult {
@@ -362,7 +368,7 @@ fn progress_to_result(
             let merged = merge_args(&call.function_name, &call.args, &call.kwargs, param_registry);
             let function_name = call.function_name.clone();
             let call_id = call.call_id;
-            let method_call = call.method_call;
+            let method_call = call.object_id.is_some();
             let handle = with_state(|s| {
                 let h = s.next_handle();
                 s.snapshots.insert(h, SnapshotState::FunctionCall(call));
@@ -384,9 +390,11 @@ fn progress_to_result(
             }
         }
         RunProgress::OsCall(call) => {
-            let args_json = monty_args_to_json(&call.args);
-            let kwargs_json = monty_kwargs_to_json(&call.kwargs);
-            let function_str = call.function.to_string();
+            let (pos_args, kw_args) = call.function_call.clone().to_args();
+            let args_json = monty_args_to_json(&pos_args);
+            let kwargs_json = monty_kwargs_to_json(&kw_args);
+            let function_name: &'static str = (&call.function_call).into();
+            let function_str = function_name.to_string();
             let call_id = call.call_id;
             let handle = with_state(|s| {
                 let h = s.next_handle();
@@ -458,7 +466,7 @@ fn progress_to_result(
 /// present in `param_registry` resolve to a `MontyObject::Function`; unknown
 /// names resolve to `Undefined`, which the VM surfaces as `NameError`.
 fn drive_progress(
-    mut result: Result<RunProgress<LimitedTracker>, MontyException>,
+    mut result: Result<RunProgress, MontyException>,
     print_writer: &mut CollectPrintWriter,
     param_registry: &HashMap<String, Vec<String>>,
 ) -> (u32, ProgressResult) {
@@ -589,7 +597,12 @@ pub extern "C" fn monty_result_read(buf_ptr: u32, buf_cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn monty_check() -> u32 {
     let result = std::panic::catch_unwind(|| {
-        let runner = MontyRun::new("x + 1".to_owned(), "check.py", vec!["x".to_owned()])
+        let runner = MontyRun::new(
+            "x + 1".to_owned(),
+            "check.py",
+            vec!["x".to_owned()],
+            CompileOptions::default(),
+        )
             .ok()?;
         let result = runner.run_no_limits(vec![MontyObject::Int(41)]).ok()?;
         match result {
@@ -673,7 +686,7 @@ pub extern "C" fn monty_compile(
         }
     }
 
-    match MontyRun::new(code, "script.py", input_names) {
+    match MontyRun::new(code, "script.py", input_names, CompileOptions::default()) {
         Ok(runner) => with_state(|s| {
             let handle = s.next_handle();
             s.runners.insert(handle, runner);
@@ -712,29 +725,26 @@ pub extern "C" fn monty_start(
     // Parse limits.
     let limits_json = unsafe { read_str(limits_ptr, limits_len) };
     let limits_input: LimitsInput = if limits_json.is_empty() {
-        LimitsInput {
-            max_allocations: None,
-            max_duration_ms: None,
-            max_memory: None,
-            max_recursion_depth: None,
-        }
+        LimitsInput::default()
     } else {
-        serde_json::from_str(&limits_json).unwrap_or(LimitsInput {
-            max_allocations: None,
-            max_duration_ms: None,
-            max_memory: None,
-            max_recursion_depth: None,
-        })
+        serde_json::from_str(&limits_json).unwrap_or_default()
     };
 
     let resource_limits = ResourceLimits {
-        max_allocations: limits_input.max_allocations,
         max_duration: limits_input.max_duration_ms.map(Duration::from_millis),
         max_memory: limits_input.max_memory,
-        max_recursion_depth: limits_input.max_recursion_depth,
         gc_interval: None,
+        max_recursion_depth: limits_input
+            .max_recursion_depth
+            .unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),
+        max_suspensions: limits_input
+            .max_suspensions
+            .unwrap_or(DEFAULT_MAX_SUSPENSIONS),
     };
-    let tracker = LimitedTracker::new(resource_limits);
+    // max_memory is enforced by the allocator, not the VM: without arming
+    // monty-alloc the limit is silently ignored.
+    let _ = monty_alloc::set_limit(resource_limits.max_memory, false);
+    let tracker = ResourceTracker::new(resource_limits);
 
     let mut print_writer = CollectPrintWriter::new();
     let initial = {

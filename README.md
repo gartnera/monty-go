@@ -314,7 +314,7 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty v0.0.11](https://github.com/pydantic/monty/releases/tag/v0.0.11).
+Tracks upstream [Monty v0.0.23](https://github.com/pydantic/monty/releases/tag/v0.0.23).
 
 - Arithmetic, string operations, f-strings, slicing
 - Functions, lambdas, closures, generators
@@ -330,20 +330,21 @@ Tracks upstream [Monty v0.0.11](https://github.com/pydantic/monty/releases/tag/v
 - Multi-module imports (`import a, b, c`)
 - Stdlib modules: `math` (all functions), `re`, `datetime`, `json`, and `sys`/`typing`/`asyncio` subsets
 - `import os`, `from pathlib import Path` (routed through OsCallFunc)
-- Dataclass *instances* flow through external function calls (args, returns, and method calls surface with `method_call=true`)
-- Resource limits: time, memory, allocations, recursion depth
+- Class definitions and methods; dataclasses
+- Context managers (`with ...`)
+- Class instances flow through external function calls (args, returns, and method calls surface with `method_call=true`)
+- Resource limits: time, memory, recursion depth, and suspensions (host calls per run)
 
 ## What Monty Cannot Do
 
-- Class definitions (only dataclass instances via external I/O; upstream Monty flags class `def` as "coming soon")
-- `match` statements (coming soon upstream)
-- Context managers (`with ...`)
+- Class inheritance (`class Foo(Bar):` is rejected at parse time), `super()`, and the `@classmethod`/`@staticmethod`/`@property` decorators
+- Generators, `match` statements, `del`, `async with`/`async for`, exception groups, PEP 695 type aliases, complex numbers
 - Rest of stdlib and all third-party libraries
 - `float('inf')` / `float('nan')` (JSON serialization limitation in this bridge)
 
 ## Tests
 
-97 end-to-end tests covering every testable scenario from Monty's core test suite:
+End-to-end tests covering every testable scenario from Monty's core test suite:
 
 ```bash
 make test

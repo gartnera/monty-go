@@ -26,12 +26,24 @@ type Runner struct {
 	compiled wazero.CompiledModule
 }
 
+// DefaultMaxSuspensions is the number of host calls one execution may make
+// when Limits.MaxSuspensions is zero, matching monty's own default.
+const DefaultMaxSuspensions = 1000
+
 // Limits configures resource limits for Python execution.
 type Limits struct {
-	MaxMemoryBytes    uint64        `json:"max_memory,omitempty"`
-	MaxDuration       time.Duration `json:"-"`
-	MaxAllocations    uint64        `json:"max_allocations,omitempty"`
-	MaxRecursionDepth uint32        `json:"max_recursion_depth,omitempty"`
+	MaxMemoryBytes uint64        `json:"max_memory,omitempty"`
+	MaxDuration    time.Duration `json:"-"`
+	// MaxAllocations is retained for source compatibility and has no effect:
+	// monty dropped allocation counting in favour of MaxMemoryBytes and
+	// MaxSuspensions.
+	MaxAllocations    uint64 `json:"max_allocations,omitempty"`
+	MaxRecursionDepth uint32 `json:"max_recursion_depth,omitempty"`
+	// MaxSuspensions bounds how many host calls (external functions and OS
+	// calls) one execution may make. It backstops code that loops on host
+	// calls, which does not advance MaxDuration. Zero uses monty's default
+	// of 1000.
+	MaxSuspensions uint64 `json:"max_suspensions,omitempty"`
 }
 
 // MarshalJSON implements custom JSON marshaling for Limits.
@@ -41,6 +53,7 @@ func (l Limits) MarshalJSON() ([]byte, error) {
 		MaxDurationMs     *uint64 `json:"max_duration_ms,omitempty"`
 		MaxMemory         *uint64 `json:"max_memory,omitempty"`
 		MaxRecursionDepth *uint32 `json:"max_recursion_depth,omitempty"`
+		MaxSuspensions    *uint64 `json:"max_suspensions,omitempty"`
 	}
 	a := alias{}
 	if l.MaxAllocations > 0 {
@@ -58,6 +71,10 @@ func (l Limits) MarshalJSON() ([]byte, error) {
 	if l.MaxRecursionDepth > 0 {
 		v := l.MaxRecursionDepth
 		a.MaxRecursionDepth = &v
+	}
+	if l.MaxSuspensions > 0 {
+		v := l.MaxSuspensions
+		a.MaxSuspensions = &v
 	}
 	return json.Marshal(a)
 }

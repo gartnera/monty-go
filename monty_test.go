@@ -1452,15 +1452,42 @@ recurse(5)
 		WithLimits(Limits{MaxRecursionDepth: 100}))
 }
 
-func TestLimitsAllocationLimit(t *testing.T) {
+// monty replaced allocation counting with a suspension budget: a bound on the
+// host calls one run may make, enforced by the host driving the resume loop.
+func TestLimitsSuspensionLimit(t *testing.T) {
 	r := newRunner(t)
 	code := `
-for i in range(10000):
-    x = [i] * 100
-x
+total = 0
+for i in range(100):
+    total += bump(i)
+total
 `
-	assertMontyError(t, r, code, nil, "MemoryError",
-		WithLimits(Limits{MaxAllocations: 5}))
+	_, err := r.Execute(context.Background(), code, nil,
+		WithLimits(Limits{MaxSuspensions: 5}),
+		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
+			return 1, nil
+		}, Func("bump", "i")))
+	if err == nil {
+		t.Fatal("expected an error once the suspension budget is exhausted")
+	}
+	if !strings.Contains(err.Error(), "max suspensions") {
+		t.Fatalf("expected a max-suspensions error, got %v", err)
+	}
+}
+
+func TestLimitsSuspensionLimitNotHitByShortRun(t *testing.T) {
+	r := newRunner(t)
+	result, err := r.Execute(context.Background(), "bump(1) + bump(2)", nil,
+		WithLimits(Limits{MaxSuspensions: 5}),
+		WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
+			return 1, nil
+		}, Func("bump", "i")))
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result != float64(2) {
+		t.Fatalf("expected 2, got %v", result)
+	}
 }
 
 func TestLimitsMemoryLimit(t *testing.T) {
