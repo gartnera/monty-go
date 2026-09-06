@@ -198,8 +198,18 @@ func (r *Runner) Execute(ctx context.Context, code string, inputs map[string]any
 	}
 
 	// Instantiate a fresh module for this execution.
+	//
+	// The module must be given the host's real clocks. wazero's default
+	// ModuleConfig supplies a *fake* nanotime that advances by a fixed step on
+	// every reading, so without WithSysNanotime the guest's sense of elapsed
+	// time races far ahead of the wall clock and Limits.MaxDuration fires
+	// almost immediately: a 10s limit would trip after ~120ms of real work.
+	// WithSysWalltime is the same story for datetime/time in Python.
 	mod, err := r.runtime.InstantiateModule(ctx, r.compiled,
-		wazero.NewModuleConfig().WithName(""))
+		wazero.NewModuleConfig().
+			WithName("").
+			WithSysNanotime().
+			WithSysWalltime())
 	if err != nil {
 		return nil, fmt.Errorf("montygo: failed to instantiate module: %w", err)
 	}
