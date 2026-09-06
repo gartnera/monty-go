@@ -26,7 +26,7 @@ tokyo = search(query="weather tokyo")
 compare(a=london, b=tokyo)
 ```
 
-One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 2.9MB WASM binary embedded in your Go binary.
+One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 4.8MB WASM binary embedded in your Go binary.
 
 For motivation, see:
 - [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
@@ -242,7 +242,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (2.9 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (4.8 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
