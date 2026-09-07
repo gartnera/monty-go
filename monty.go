@@ -90,11 +90,20 @@ type FunctionCall struct {
 
 // ArgsJSON returns Args serialized as a JSON string, suitable for passing
 // directly to tool handlers that accept JSON argument strings.
+//
+// The typed values (see values.go) are flattened to their plain JSON shapes
+// first — bytes to a base64 string, a tuple or set to an array, a date to its
+// ISO form — because a tool handler expects ordinary JSON, not this bridge's
+// internal tagging. Read fc.Args directly when the distinction matters.
 func (fc *FunctionCall) ArgsJSON() string {
 	if len(fc.Args) == 0 {
 		return "{}"
 	}
-	b, err := json.Marshal(fc.Args)
+	plain := make(map[string]any, len(fc.Args))
+	for k, v := range fc.Args {
+		plain[k] = plainValue(v)
+	}
+	b, err := json.Marshal(plain)
 	if err != nil {
 		return "{}"
 	}
@@ -127,15 +136,55 @@ type ExternalFunc func(ctx context.Context, call *FunctionCall) (any, error)
 // OsCallFunc is called when Python code performs an OS operation.
 type OsCallFunc func(ctx context.Context, call *OsCall) (any, error)
 
+// FutureResolver is called when every branch of the sandboxed program is
+// blocked awaiting host work, so the interpreter can make no further progress
+// without results.
+//
+// It receives the call IDs of every external call still outstanding — the ones
+// whose handler returned [Pending] — and must return a value for at least one
+// of them, keyed by call ID. Resolving a subset is fine and often the point:
+// return whichever finished first and the resolver is called again for the
+// rest. A value may be a [PyError] to make that awaited call raise inside the
+// guest.
+//
+// Returning no results at all would leave the program blocked forever, so it
+// is treated as an error rather than looping.
+type FutureResolver func(ctx context.Context, callIDs []uint32) (map[uint32]any, error)
+
+// Pending is what an [ExternalFunc] returns to service a call
+// asynchronously instead of answering it now.
+//
+// The guest gets an awaitable rather than a value, and execution carries on
+// until it actually needs the result. When everything is blocked, the
+// [FutureResolver] configured with [WithFutureResolver] is asked for results
+// by call ID. This is what makes `asyncio.gather` over host calls concurrent:
+// several calls go out, all return Pending, and the host completes them in
+// whatever order it likes.
+//
+// Returning Pending without a resolver configured is an error — nothing would
+// ever complete the call.
+//
+//	func handle(ctx context.Context, call *montygo.FunctionCall) (any, error) {
+//	    go doWork(call.CallID)   // completes later
+//	    return montygo.Pending{}, nil
+//	}
+type Pending struct{}
+
+// MarshalJSON implements [json.Marshaler].
+func (Pending) MarshalJSON() ([]byte, error) {
+	return json.Marshal(tagged("future", nil))
+}
+
 // ExecuteOption configures a single Execute call.
 type ExecuteOption func(*executeConfig)
 
 type executeConfig struct {
-	externalFunc ExternalFunc
-	osCallFunc   OsCallFunc
-	limits       Limits
-	printFunc    func(string)
-	extFuncs     []FuncDef
+	externalFunc   ExternalFunc
+	osCallFunc     OsCallFunc
+	futureResolver FutureResolver
+	limits         Limits
+	printFunc      func(string)
+	extFuncs       []FuncDef
 }
 
 // WithExternalFunc sets the callback for external function calls.
@@ -151,6 +200,12 @@ func WithExternalFunc(fn ExternalFunc, funcs ...FuncDef) ExecuteOption {
 // WithOsCallFunc sets the callback for OS-level operations.
 func WithOsCallFunc(fn OsCallFunc) ExecuteOption {
 	return func(c *executeConfig) { c.osCallFunc = fn }
+}
+
+// WithFutureResolver sets the callback that completes external calls whose
+// handler returned [Pending]. Required only if a handler ever does.
+func WithFutureResolver(fn FutureResolver) ExecuteOption {
+	return func(c *executeConfig) { c.futureResolver = fn }
 }
 
 // WithLimits sets resource limits for the execution.

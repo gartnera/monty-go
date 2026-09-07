@@ -261,7 +261,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 - **No CGO.** wazero is a pure-Go WebAssembly runtime.
 - **No subprocess.** The WASM binary is embedded via `go:embed` and compiled once at startup.
 - **Fresh instance per call.** Each `Execute()` gets an isolated WASM instance. No state leaks between calls.
-- **JSON at the boundary.** All data crossing the Go↔WASM boundary is JSON. Go types map naturally: `int`→`float64`, `string`→`string`, `bool`→`bool`, `nil`→`None`, `[]any`→`list`, `map[string]any`→`dict`.
+- **JSON at the boundary.** All data crossing the Go↔WASM boundary is JSON. Go types map naturally: `int`→`float64`, `string`→`string`, `bool`→`bool`, `nil`→`None`, `[]any`→`list`, `map[string]any`→`dict`. Types with no JSON spelling — `bytes`, datetimes, a stat result, an open file — travel as a tagged object and surface as the typed Go values in [Types](#types).
 
 ## API
 
@@ -279,6 +279,7 @@ montygo.WithExternalFunc(fn,                     // register callable functions
     montygo.Func("calculate", "expression"),
 )
 montygo.WithOsCallFunc(fn)                       // handle filesystem/env access
+montygo.WithFutureResolver(fn)                   // complete calls that returned Pending
 montygo.WithLimits(montygo.Limits{...})          // resource limits
 montygo.WithPrintFunc(fn)                        // capture print output
 
@@ -289,6 +290,8 @@ call.ArgsJSON()                // pre-serialized JSON string
 
 ### Types
 
+Values whose Python type maps onto JSON need no wrapper:
+
 | Python | Go (result) | Go (input) |
 |--------|------------|------------|
 | `int` | `float64` | `int`, `float64` |
@@ -296,9 +299,109 @@ call.ArgsJSON()                // pre-serialized JSON string
 | `str` | `string` | `string` |
 | `bool` | `bool` | `bool` |
 | `None` | `nil` | `nil` |
-| `list`, `tuple` | `[]any` | `[]any` |
+| `list` | `[]any` | `[]any` |
 | `dict` | `map[string]any` | `map[string]any` |
-| `set` | `[]any` | — |
+
+Everything else Monty supports has no JSON spelling, so it crosses as a typed
+Go value. You can return any of these from a handler:
+
+| Python | Go |
+|--------|-----|
+| `bytes` | `montygo.Bytes` |
+| `tuple` | `montygo.Tuple` |
+| `set`, `frozenset` | `montygo.Set`, `montygo.FrozenSet` |
+| a named tuple | `montygo.NamedTuple` |
+| `os.stat_result` | `montygo.StatResult` |
+| `pathlib.Path` | `montygo.Path` |
+| `datetime.date` | `montygo.Date` |
+| `datetime.datetime` | `montygo.DateTime` |
+| `datetime.time` | `montygo.Time` |
+| `datetime.timedelta` | `montygo.TimeDelta` |
+| `datetime.timezone` | `montygo.TimeZone` |
+| an open file (`_io.TextIOWrapper`, ...) | `montygo.FileHandle` |
+| an `int` beyond int64 | `montygo.BigInt` |
+| an exception value | `montygo.ExceptionValue` |
+| `type`, a builtin, a function | `montygo.TypeValue`, `montygo.BuiltinFunction`, `montygo.Function` |
+| `...`, `NotImplemented` | `montygo.Ellipsis`, `montygo.NotImplemented` |
+
+The distinctions matter: `bytes` is not a list of ints, a `date` is not its
+string form, and `Path.read_bytes`, `Path.stat`, `date.today` and
+`datetime.now` are rejected or silently wrong if answered with the wrong one.
+
+**The two directions are not symmetric.** Every type above can be *sent*; only
+the ones JSON cannot carry faithfully come back in `OsCall.Args`,
+`FunctionCall.Args` or `Execute`'s result — `Bytes`, the date/time types,
+`FileHandle`, `BigInt` (only past int64), `TypeValue`, `BuiltinFunction`,
+`Function`, `Repr`, `Cycle` and `NotImplemented`. A Python tuple, set, named
+tuple, exception value or `Path` arrives as its plain shape (`[]any`,
+`map[string]any`, a string), because that is what handlers want: every
+filesystem OS call passes its path as a string.
+
+> **Upgrading:** `Path.write_bytes` and other binary payloads now arrive as
+> `montygo.Bytes` rather than a `[]any` of ints. A handler that did
+> `call.Args[1].([]any)` needs `call.Args[1].(montygo.Bytes)`. Path arguments
+> are unchanged — still plain strings.
+
+### `open()`
+
+`open()` works, and needs one thing from your `OsCallFunc`: answer the `open`
+call with a `montygo.FileHandle`. Monty holds no file descriptor — it builds
+its own file object from the handle, and each later read or write arrives as an
+ordinary one-shot `Path.read_text` / `Path.write_text` call. So the handler
+performs the open-time effect (truncate for `"w"`, create for `"a"`, an
+existence check for `"r"`) and returns the handle:
+
+```go
+case "open":
+    path, _ := call.Args[0].(string)
+    mode, _ := call.Args[1].(string)
+    if err := yourStorage.PrepareOpen(path, mode); err != nil {
+        return nil, &montygo.PyError{Type: "FileNotFoundError", Message: path}
+    }
+    return montygo.FileHandle{Path: path, Mode: mode}, nil
+```
+
+Python then gets a real file: `read()`, `read(n)`, `readline()`,
+`readlines()`, `write()`, `seek()`, `tell()`, `close()`, `with open(...) as f`,
+and `.name` / `.mode` / `.closed`. Iterating a file (`for line in f`) is not
+supported upstream — use `readlines()`.
+
+### Raising Python exceptions from a handler
+
+An ordinary `error` from a handler is a host-side fault: it ends the execution
+and `Execute` returns it. To fail the *Python* call instead — so sandboxed code
+can catch it — return a `*montygo.PyError`:
+
+```go
+return nil, &montygo.PyError{Type: "FileNotFoundError", Message: "no such file: " + path}
+```
+
+```python
+try:
+    data = open("missing.txt").read()
+except FileNotFoundError:
+    data = ""
+```
+
+`Type` is any Python exception name; an empty or unrecognized one raises
+`OSError`. A `PyError` is found anywhere in the error chain, so wrapping it in
+context still reaches Python as the right exception.
+
+### Async host calls
+
+A handler can service a call asynchronously by returning `montygo.Pending{}`:
+the guest gets an awaitable and execution carries on. When every branch is
+blocked, the `montygo.FutureResolver` you set with `WithFutureResolver` is
+handed the outstanding call IDs and returns results for any of them. This is
+what makes `asyncio.gather` over host calls actually concurrent — several calls
+go out, all return `Pending`, and you complete them in any order. Resolving a
+subset is fine; the resolver is called again for the rest. A `*PyError` as a
+result raises at that `await`; any other `error` ends the run, as it does in a
+synchronous handler.
+
+`Pending` is for external functions only. An OS call has no await point in the
+sandboxed code — `Path.read_text()` is a plain call — so block in the handler
+instead if the work is slow.
 
 ### Errors
 
@@ -329,7 +432,9 @@ Tracks upstream [Monty v0.0.23](https://github.com/pydantic/monty/releases/tag/v
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
 - Multi-module imports (`import a, b, c`)
 - Stdlib modules: `math` (all functions), `re`, `datetime`, `json`, and `sys`/`typing`/`asyncio` subsets
-- `import os`, `from pathlib import Path` (routed through OsCallFunc)
+- `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc)
+- Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently
+- Host failures as catchable Python exceptions (`PyError`)
 - Class definitions and methods; dataclasses
 - Context managers (`with ...`)
 - Class instances flow through external function calls (args, returns, and method calls surface with `method_call=true`)

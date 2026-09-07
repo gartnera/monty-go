@@ -3,6 +3,7 @@ package montygo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/tetratelabs/wazero/api"
@@ -274,7 +275,9 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			if err := json.Unmarshal(*progress.Value, &val); err != nil {
 				return nil, fmt.Errorf("montygo: failed to parse result value: %w", err)
 			}
-			return val, nil
+			// Typed values (bytes, a datetime, a stat result, ...) arrive
+			// tagged; hand the caller the Go type, not the wire form.
+			return decodeValue(val), nil
 
 		case statusError:
 			errMsg := "unknown error"
@@ -302,7 +305,14 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 
 			returnVal, fnErr := cfg.externalFunc(ctx, call)
 			if fnErr != nil {
-				return nil, fmt.Errorf("montygo: external function %q failed: %w", call.Name, fnErr)
+				// A PyError is the handler asking for a catchable Python
+				// exception; any other error is a host-side failure that ends
+				// the run.
+				var pyErr *PyError
+				if !errors.As(fnErr, &pyErr) {
+					return nil, fmt.Errorf("montygo: external function %q failed: %w", call.Name, fnErr)
+				}
+				returnVal = pyErr.raiseValue()
 			}
 
 			status, err = inst.resumeWithValue(ctx, derefU32(progress.SnapshotHandle), returnVal)
@@ -329,8 +339,24 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			}
 
 			returnVal, fnErr := cfg.osCallFunc(ctx, call)
+			if _, pending := returnVal.(Pending); pending {
+				// There is no await point behind an OS call — `Path.read_text()`
+				// is a plain call in the guest — so a future here would only
+				// leave a coroutine nobody awaits.
+				return nil, fmt.Errorf(
+					"montygo: OS call %q returned Pending, which only external functions support: "+
+						"an OS call has no await point in the sandboxed code, so answer it "+
+						"synchronously (block in the handler if the work is slow)", call.Function)
+			}
 			if fnErr != nil {
-				return nil, fmt.Errorf("montygo: OS call %q failed: %w", call.Function, fnErr)
+				// As above: a PyError becomes a Python exception raised at the
+				// call site, so sandboxed code can catch "no such file" the
+				// way it would under CPython. Anything else ends the run.
+				var pyErr *PyError
+				if !errors.As(fnErr, &pyErr) {
+					return nil, fmt.Errorf("montygo: OS call %q failed: %w", call.Function, fnErr)
+				}
+				returnVal = pyErr.raiseValue()
 			}
 
 			status, err = inst.resumeWithValue(ctx, derefU32(progress.SnapshotHandle), returnVal)
@@ -339,12 +365,78 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			}
 
 		case statusResolveFutures:
-			return nil, fmt.Errorf("montygo: async futures not yet supported")
+			// Every branch of the program is blocked on host work. The
+			// interpreter cannot advance until at least one outstanding call
+			// has a result, so ask the resolver for some.
+			suspensions++
+			if suspensions > maxSuspensions {
+				return nil, &MontyError{Message: fmt.Sprintf(
+					"exceeded max suspensions (%d host calls)", maxSuspensions)}
+			}
+			if cfg.futureResolver == nil {
+				return nil, fmt.Errorf(
+					"montygo: %d external call(s) are awaiting results but no future resolver is "+
+						"configured; pass WithFutureResolver if a handler returns Pending",
+					len(progress.PendingCallIDs))
+			}
+			results, resErr := cfg.futureResolver(ctx, progress.PendingCallIDs)
+			if resErr != nil {
+				return nil, fmt.Errorf("montygo: future resolver failed: %w", resErr)
+			}
+			if len(results) == 0 {
+				return nil, fmt.Errorf(
+					"montygo: future resolver returned no results for %d pending call(s); "+
+						"at least one must be resolved for execution to continue",
+					len(progress.PendingCallIDs))
+			}
+
+			status, err = inst.resumeFutures(ctx, derefU32(progress.SnapshotHandle), results)
+			if err != nil {
+				return nil, err
+			}
 
 		default:
 			return nil, fmt.Errorf("montygo: unknown status code %d", status)
 		}
 	}
+}
+
+// resumeFutures serializes resolved future results and calls
+// monty_resume_futures. The shim expects [[call_id, value], ...] — pairs
+// rather than an object, because JSON object keys are strings and these are
+// call ids.
+func (inst *instance) resumeFutures(ctx context.Context, snapshotHandle uint32, results map[uint32]any) (uint32, error) {
+	pairs := make([][2]any, 0, len(results))
+	for id, value := range results {
+		if err, ok := value.(error); ok {
+			// A PyError makes that one awaited call raise inside the guest,
+			// matching what a synchronous handler can do. Any other error is
+			// a host-side fault and ends the run, also matching the
+			// synchronous path — resuming the await with a value would report
+			// the failure as a success.
+			var pyErr *PyError
+			if !errors.As(err, &pyErr) {
+				return 0, fmt.Errorf("montygo: future resolver failed for call %d: %w", id, err)
+			}
+			value = pyErr.raiseValue()
+		}
+		pairs = append(pairs, [2]any{id, value})
+	}
+
+	valPtr, valLen, err := inst.writeJSON(ctx, pairs)
+	if err != nil {
+		return 0, err
+	}
+	defer inst.freeWasmMem(ctx, valPtr, valLen)
+
+	res, err := inst.resumeFut.Call(ctx,
+		uint64(snapshotHandle),
+		uint64(valPtr), uint64(valLen),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("montygo: monty_resume_futures call failed: %w", err)
+	}
+	return uint32(res[0]), nil
 }
 
 // resumeWithValue serializes the return value and calls monty_resume.
@@ -399,22 +491,30 @@ func derefU32(v *uint32) uint32 {
 	return *v
 }
 
-// rawArrayToAny converts a JSON array raw message to Go []any.
+// rawArrayToAny converts a JSON array raw message to Go []any, decoding any
+// tagged typed values it contains (see decodeValue).
 func rawArrayToAny(raw *json.RawMessage) []any {
 	if raw == nil {
 		return nil
 	}
 	var result []any
 	_ = json.Unmarshal(*raw, &result)
+	for i, v := range result {
+		result[i] = decodeValue(v)
+	}
 	return result
 }
 
-// rawObjectToMap converts a JSON object raw message to Go map[string]any.
+// rawObjectToMap converts a JSON object raw message to Go map[string]any,
+// decoding any tagged typed values it contains (see decodeValue).
 func rawObjectToMap(raw *json.RawMessage) map[string]any {
 	if raw == nil {
 		return nil
 	}
 	var result map[string]any
 	_ = json.Unmarshal(*raw, &result)
+	for k, v := range result {
+		result[k] = decodeValue(v)
+	}
 	return result
 }
