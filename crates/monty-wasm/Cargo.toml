@@ -7,11 +7,14 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23" }
-monty-alloc = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23" }
+# tzdb-bundled compiles the IANA zone rules in, so a host can give the
+# sandbox a named local zone (Europe/London) with its DST transitions; the
+# wasm module has no filesystem to read a system tz database from.
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", features = ["tzdb-bundled"] }
+monty-alloc = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0" }
 # Needed to parse an arbitrary-precision int a host sends across the JSON
 # boundary as a digit string (MontyObject::BigInt). Already in the lock file
 # via monty itself.

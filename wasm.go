@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tetratelabs/wazero/api"
 )
@@ -24,6 +25,7 @@ type instance struct {
 	alloc     api.Function
 	dealloc   api.Function
 	compile   api.Function
+	configure api.Function
 	start     api.Function
 	resume    api.Function
 	resumeFut api.Function
@@ -50,6 +52,9 @@ func (inst *instance) resolveExports() error {
 		return err
 	}
 	if inst.compile, err = resolve("monty_compile"); err != nil {
+		return err
+	}
+	if inst.configure, err = resolve("monty_configure"); err != nil {
 		return err
 	}
 	if inst.start, err = resolve("monty_start"); err != nil {
@@ -163,9 +168,12 @@ type progressResult struct {
 	Args           *json.RawMessage `json:"args,omitempty"`
 	Kwargs         *json.RawMessage `json:"kwargs,omitempty"`
 	CallID         *uint32          `json:"call_id,omitempty"`
+	AcceptsFuture  bool             `json:"accepts_future,omitempty"`
 	PendingCallIDs []uint32         `json:"pending_call_ids,omitempty"`
 	Error          *string          `json:"error,omitempty"`
-	PrintOutput    *string          `json:"print_output,omitempty"`
+	// Output is everything printed since the previous suspension, in order,
+	// as [stream, text] pairs; stream is "stdout" or "stderr".
+	Output [][2]string `json:"output,omitempty"`
 }
 
 // execute runs the full compile->start->resume loop.
@@ -211,7 +219,23 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 	}
 	defer func() { _, _ = inst.freeRun.Call(ctx, uint64(runnerHandle)) }()
 
-	// 2. Start execution.
+	// 2. Configure the working directory and OS policy.
+	if cfg.run != (runConfig{}) {
+		confPtr, confLen, err := inst.writeJSON(ctx, cfg.run)
+		if err != nil {
+			return nil, err
+		}
+		defer inst.freeWasmMem(ctx, confPtr, confLen)
+		ok, err := inst.configure.Call(ctx, uint64(runnerHandle), uint64(confPtr), uint64(confLen))
+		if err != nil {
+			return nil, fmt.Errorf("montygo: monty_configure call failed: %w", err)
+		}
+		if ok[0] == 0 {
+			return nil, inst.readError(ctx)
+		}
+	}
+
+	// 3. Start execution.
 	inputsPtr, inputsLen, err := inst.writeJSON(ctx, inputValues)
 	if err != nil {
 		return nil, err
@@ -234,7 +258,7 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 	}
 	status := uint32(startResult[0])
 
-	// 3. Loop on progress.
+	// 4. Loop on progress.
 	//
 	// monty stores max_suspensions but does not enforce it — the host counts
 	// the suspensions it services. It backstops sandboxed code that loops on
@@ -245,6 +269,9 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 		maxSuspensions = DefaultMaxSuspensions
 	}
 	var suspensions uint64
+	// slept is the time spent in system sleeps so far, charged against
+	// Limits.MaxTotalSleep.
+	var slept time.Duration
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -261,9 +288,15 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			return nil, fmt.Errorf("montygo: failed to parse progress JSON: %w (raw: %s)", err, string(result))
 		}
 
-		// Deliver print output.
-		if progress.PrintOutput != nil && cfg.printFunc != nil {
-			cfg.printFunc(*progress.PrintOutput)
+		// Deliver print output, each run to its stream's callback.
+		for _, entry := range progress.Output {
+			out := cfg.printFunc
+			if entry[0] == "stderr" && cfg.stderrFunc != nil {
+				out = cfg.stderrFunc
+			}
+			if out != nil {
+				out(entry[1])
+			}
 		}
 
 		switch status {
@@ -326,11 +359,6 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 				return nil, &MontyError{Message: fmt.Sprintf(
 					"exceeded max suspensions (%d host calls)", maxSuspensions)}
 			}
-			if cfg.osCallFunc == nil {
-				return nil, fmt.Errorf("montygo: OS call %q but no handler configured",
-					deref(progress.OsFunction))
-			}
-
 			call := &OsCall{
 				Function: deref(progress.OsFunction),
 				Args:     rawArrayToAny(progress.Args),
@@ -338,15 +366,36 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 				CallID:   derefU32(progress.CallID),
 			}
 
+			// Sleeps under SleepSystem are the bridge's to perform, never the
+			// handler's: the interpreter has already capped the delay, and
+			// what is left is waiting it out and charging the budget.
+			if isSystemSleep(call.Function) {
+				reply, err := systemSleep(ctx, call, &slept, cfg.limits.MaxTotalSleep)
+				if err != nil {
+					return nil, err
+				}
+				status, err = inst.resumeWithValue(ctx, derefU32(progress.SnapshotHandle), reply)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			if cfg.osCallFunc == nil {
+				return nil, fmt.Errorf("montygo: OS call %q but no handler configured", call.Function)
+			}
+
 			returnVal, fnErr := cfg.osCallFunc(ctx, call)
-			if _, pending := returnVal.(Pending); pending {
+			if _, pending := returnVal.(Pending); pending && !progress.AcceptsFuture {
 				// There is no await point behind an OS call — `Path.read_text()`
 				// is a plain call in the guest — so a future here would only
-				// leave a coroutine nobody awaits.
+				// leave a coroutine nobody awaits. `asyncio.sleep` under
+				// SleepHost is the one exception, and the shim says so.
 				return nil, fmt.Errorf(
-					"montygo: OS call %q returned Pending, which only external functions support: "+
-						"an OS call has no await point in the sandboxed code, so answer it "+
-						"synchronously (block in the handler if the work is slow)", call.Function)
+					"montygo: OS call %q returned Pending, which only external functions "+
+						"and asyncio.sleep support: an OS call has no await point in the sandboxed "+
+						"code, so answer it synchronously (block in the handler if the work is slow)",
+					call.Function)
 			}
 			if fnErr != nil {
 				// As above: a PyError becomes a Python exception raised at the
@@ -399,6 +448,56 @@ func (inst *instance) execute(ctx context.Context, code string, inputs map[strin
 			return nil, fmt.Errorf("montygo: unknown status code %d", status)
 		}
 	}
+}
+
+// isSystemSleep reports whether an OS call is a sleep under SleepSystem, which
+// the bridge performs itself.
+func isSystemSleep(function string) bool {
+	return function == "system.sleep" || function == "system.async_sleep"
+}
+
+// systemSleep waits out a sleep under SleepSystem and returns the reply to
+// resume with. The delay arrives in seconds, already capped by the
+// interpreter. It is charged against maxTotal before any waiting, so a run
+// over budget fails at once and deterministically, with an uncatchable
+// TimeoutError — the same contract monty's own hosts keep. A cancelled
+// context ends the run rather than the sleep.
+//
+// An asyncio sleep is waited out the same way rather than answered with a
+// future: like monty's own hosts, the bridge has no event loop of its own to
+// run sibling tasks on meanwhile.
+func systemSleep(ctx context.Context, call *OsCall, slept *time.Duration, maxTotal time.Duration) (any, error) {
+	var seconds float64
+	if len(call.Args) > 0 {
+		switch v := call.Args[0].(type) {
+		case float64:
+			seconds = v
+		case int:
+			seconds = float64(v)
+		}
+	}
+	delay := time.Duration(seconds * float64(time.Second))
+	if delay < 0 {
+		delay = 0
+	}
+	total := *slept + delay
+	if maxTotal > 0 && total > maxTotal {
+		return tagged("abort", map[string]any{
+			"type":    "TimeoutError",
+			"message": fmt.Sprintf("sleep limit exceeded: %v > %v", total, maxTotal),
+		}), nil
+	}
+	*slept = total
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, nil
 }
 
 // resumeFutures serializes resolved future results and calls

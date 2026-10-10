@@ -26,7 +26,7 @@ tokyo = search(query="weather tokyo")
 compare(a=london, b=tokyo)
 ```
 
-One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 4.8MB WASM binary embedded in your Go binary.
+One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 6MB WASM binary embedded in your Go binary.
 
 For motivation, see:
 - [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
@@ -111,20 +111,22 @@ result, err := runner.Execute(ctx, code, nil,
 
 ## Resource Limits
 
-Prevent runaway code with memory, time, allocation, and recursion limits:
+Prevent runaway code with memory, time, recursion, host-call and sleep limits:
 
 ```go
 result, err := runner.Execute(ctx, code, inputs,
     montygo.WithLimits(montygo.Limits{
-        MaxDuration:       5 * time.Second,
+        MaxDuration:       5 * time.Second,  // execution time, excluding host calls and sleeps
+        MaxTurnDuration:   time.Second,      // execution time between two host calls
         MaxMemoryBytes:    10 * 1024 * 1024, // 10 MB
-        MaxAllocations:    100000,
         MaxRecursionDepth: 100,
+        MaxSuspensions:    500,              // host calls per run
+        MaxTotalSleep:     30 * time.Second, // time.sleep()/asyncio.sleep() per run
     }),
 )
 ```
 
-Infinite loops, memory bombs, and deep recursion all terminate cleanly with a `*MontyError`. Go's `context.Context` deadlines are also respected — cancel the context and the WASM instance stops.
+Infinite loops, memory bombs, and deep recursion all terminate cleanly with a `*MontyError`. Go's `context.Context` deadlines are also respected — cancel the context and the WASM instance stops, even mid-sleep.
 
 ## Print Capture
 
@@ -137,6 +139,10 @@ _, err := runner.Execute(ctx, `print("step 1 done")`, nil,
 )
 fmt.Print(output.String()) // "step 1 done\n"
 ```
+
+`print(..., file=sys.stderr)` goes to the `WithStderrFunc` callback when one is
+set, and to the print callback otherwise, so nothing printed is lost. Output
+reaches the callbacks in the order it was printed.
 
 ## OS Calls
 
@@ -166,6 +172,35 @@ data
 ```
 
 No filesystem access happens unless your callback allows it.
+
+Paths in `call.Args` are always absolute. The interpreter keeps a virtual
+working directory — `/` unless you set one with `montygo.WithCwd("/work")` —
+and resolves relative paths against it before a call leaves the sandbox, so
+`Path("a.txt")` arrives as `/work/a.txt`. `os.getcwd()` reports it, and
+`os.chdir()` moves it after checking the target with a `Path.stat` call
+(answer with a `montygo.StatResult`).
+
+## Clocks, Sleep and Randomness
+
+`montygo.WithOsPolicy` decides how the sandbox answers `time.time()`,
+`datetime.now()`, `date.today()`, `time.sleep()`, `asyncio.sleep()` and an
+unseeded `random`. The default needs nothing from you: the real clock, UTC as
+the local zone, sleeps that really wait (capped at 10s each; the bridge does the
+waiting and stops when the context is cancelled), and fresh entropy for
+`random`. Override any part to make a run deterministic or to hand it to your
+handler:
+
+```go
+montygo.WithOsPolicy(montygo.OsPolicy{
+    DateTime: montygo.DateTimeFixed(time.Unix(1_700_000_000, 0)), // or DateTimeHost
+    TimeZone: montygo.TimeZoneNamed("Europe/London"),            // IANA rules are compiled in
+    Sleep:    montygo.SleepSystem(time.Minute),                   // or SleepZero, SleepHost
+    Random:   montygo.RandomSeedInt(big.NewInt(42)),              // or RandomHost
+})
+```
+
+`os.urandom(n)` always asks your `OsCallFunc`, as an `os.urandom` call: answer
+with `n` bytes of `montygo.Bytes` (monty rejects any other length).
 
 ## Gollem Integration
 
@@ -242,7 +277,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (4.8 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (6.0 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
@@ -282,6 +317,9 @@ montygo.WithOsCallFunc(fn)                       // handle filesystem/env access
 montygo.WithFutureResolver(fn)                   // complete calls that returned Pending
 montygo.WithLimits(montygo.Limits{...})          // resource limits
 montygo.WithPrintFunc(fn)                        // capture print output
+montygo.WithStderrFunc(fn)                       // capture print(..., file=sys.stderr)
+montygo.WithCwd("/work")                         // sandbox working directory
+montygo.WithOsPolicy(montygo.OsPolicy{...})      // clocks, local zone, sleep, random
 
 // FunctionCall provides named args (positional mapped by param name):
 call.Args["query"].(string)    // access by parameter name
@@ -308,6 +346,7 @@ Go value. You can return any of these from a handler:
 | Python | Go |
 |--------|-----|
 | `bytes` | `montygo.Bytes` |
+| `complex` | `montygo.Complex` |
 | `tuple` | `montygo.Tuple` |
 | `set`, `frozenset` | `montygo.Set`, `montygo.FrozenSet` |
 | a named tuple | `montygo.NamedTuple` |
@@ -330,7 +369,7 @@ string form, and `Path.read_bytes`, `Path.stat`, `date.today` and
 
 **The two directions are not symmetric.** Every type above can be *sent*; only
 the ones JSON cannot carry faithfully come back in `OsCall.Args`,
-`FunctionCall.Args` or `Execute`'s result — `Bytes`, the date/time types,
+`FunctionCall.Args` or `Execute`'s result — `Bytes`, `Complex`, the date/time types,
 `FileHandle`, `BigInt` (only past int64), `TypeValue`, `BuiltinFunction`,
 `Function`, `Repr`, `Cycle` and `NotImplemented`. A Python tuple, set, named
 tuple, exception value or `Path` arrives as its plain shape (`[]any`,
@@ -399,9 +438,10 @@ subset is fine; the resolver is called again for the rest. A `*PyError` as a
 result raises at that `await`; any other `error` ends the run, as it does in a
 synchronous handler.
 
-`Pending` is for external functions only. An OS call has no await point in the
-sandboxed code — `Path.read_text()` is a plain call — so block in the handler
-instead if the work is slow.
+`Pending` is for external functions, plus the one OS call the guest awaits:
+`asyncio.sleep` under `montygo.SleepHost`. Any other OS call has no await point
+in the sandboxed code — `Path.read_text()` is a plain call — so block in the
+handler instead if the work is slow.
 
 ### Errors
 
@@ -417,10 +457,10 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty v0.0.23](https://github.com/pydantic/monty/releases/tag/v0.0.23).
+Tracks upstream [Monty v1.1.0](https://github.com/pydantic/monty/releases/tag/v1.1.0).
 
-- Arithmetic, string operations, f-strings, slicing
-- Functions, lambdas, closures, generators
+- Arithmetic, string operations, f-strings, `%`-formatting, `format()`, slicing, `complex` numbers
+- Functions, lambdas, closures, decorators on functions and classes; `eval()`, `exec()` and `locals()`
 - `for`/`while` loops, `if`/`elif`/`else`, `break`/`continue`
 - `try`/`except`/`finally`/`else`, `raise`, exception hierarchy
 - List/dict/set comprehensions, dict/set view operators
@@ -431,19 +471,21 @@ Tracks upstream [Monty v0.0.23](https://github.com/pydantic/monty/releases/tag/v
 - Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
 - Multi-module imports (`import a, b, c`)
-- Stdlib modules: `math` (all functions), `re`, `datetime`, `json`, and `sys`/`typing`/`asyncio` subsets
-- `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc)
+- Stdlib modules: `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime` (with time zones), `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.1.0/docs/limitations)
+- `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc), relative to a working directory (`os.getcwd()`/`os.chdir()`)
+- `print(..., file=sys.stderr)` as its own stream
 - Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently
 - Host failures as catchable Python exceptions (`PyError`)
 - Class definitions and methods; dataclasses
 - Context managers (`with ...`)
 - Class instances flow through external function calls (args, returns, and method calls surface with `method_call=true`)
-- Resource limits: time, memory, recursion depth, and suspensions (host calls per run)
+- Resource limits: time (per run and per turn), memory, recursion depth, suspensions (host calls per run) and total sleep
 
 ## What Monty Cannot Do
 
 - Class inheritance (`class Foo(Bar):` is rejected at parse time), `super()`, and the `@classmethod`/`@staticmethod`/`@property` decorators
-- Generators, `match` statements, `del`, `async with`/`async for`, exception groups, PEP 695 type aliases, complex numbers
+- Generator functions (`yield`; generator expressions materialize to lists), `match` statements, `del`, `async with`/`async for`, exception groups, PEP 695 type aliases
+- Ordering comparisons between `Path` objects (`sorted(Path(".").iterdir())` raises `TypeError`; sort the strings)
 - Rest of stdlib and all third-party libraries
 - `float('inf')` / `float('nan')` (JSON serialization limitation in this bridge)
 
@@ -459,7 +501,7 @@ Covers: basic expressions, print variants, all exception types, data type round-
 
 ## Building from Source
 
-Requires Rust with `wasm32-wasip1` target and Go 1.23+:
+Requires Rust 1.99+ with the `wasm32-wasip1` target, and Go 1.23+:
 
 ```bash
 rustup target add wasm32-wasip1

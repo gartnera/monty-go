@@ -6,9 +6,13 @@ package montygo
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -32,8 +36,20 @@ const DefaultMaxSuspensions = 1000
 
 // Limits configures resource limits for Python execution.
 type Limits struct {
-	MaxMemoryBytes uint64        `json:"max_memory,omitempty"`
-	MaxDuration    time.Duration `json:"-"`
+	// MaxMemoryBytes caps the interpreter's heap. Crossing it raises
+	// MemoryError in the program.
+	MaxMemoryBytes uint64 `json:"max_memory,omitempty"`
+	// MaxDuration bounds the run's execution time, excluding time suspended
+	// in host calls and sleeps. Crossing it raises TimeoutError.
+	MaxDuration time.Duration `json:"-"`
+	// MaxTurnDuration bounds the execution time between two host calls,
+	// which lets a host bound its own response time per call.
+	MaxTurnDuration time.Duration `json:"-"`
+	// MaxTotalSleep bounds the time the run may spend in sleeps the bridge
+	// performs under [SleepSystem]. A sleep that would exceed it ends the run
+	// with a TimeoutError the program cannot catch, before waiting at all.
+	// Zero means no limit beyond the context's deadline.
+	MaxTotalSleep time.Duration `json:"-"`
 	// MaxAllocations is retained for source compatibility and has no effect:
 	// monty dropped allocation counting in favour of MaxMemoryBytes and
 	// MaxSuspensions.
@@ -51,6 +67,8 @@ func (l Limits) MarshalJSON() ([]byte, error) {
 	type alias struct {
 		MaxAllocations    *uint64 `json:"max_allocations,omitempty"`
 		MaxDurationMs     *uint64 `json:"max_duration_ms,omitempty"`
+		MaxTurnDurationMs *uint64 `json:"max_turn_duration_ms,omitempty"`
+		MaxTotalSleepMs   *uint64 `json:"max_total_sleep_ms,omitempty"`
 		MaxMemory         *uint64 `json:"max_memory,omitempty"`
 		MaxRecursionDepth *uint32 `json:"max_recursion_depth,omitempty"`
 		MaxSuspensions    *uint64 `json:"max_suspensions,omitempty"`
@@ -63,6 +81,14 @@ func (l Limits) MarshalJSON() ([]byte, error) {
 	if l.MaxDuration > 0 {
 		v := uint64(l.MaxDuration.Milliseconds())
 		a.MaxDurationMs = &v
+	}
+	if l.MaxTurnDuration > 0 {
+		v := uint64(l.MaxTurnDuration.Milliseconds())
+		a.MaxTurnDurationMs = &v
+	}
+	if l.MaxTotalSleep > 0 {
+		v := uint64(l.MaxTotalSleep.Milliseconds())
+		a.MaxTotalSleepMs = &v
 	}
 	if l.MaxMemoryBytes > 0 {
 		v := l.MaxMemoryBytes
@@ -123,6 +149,10 @@ func Func(name string, params ...string) FuncDef {
 }
 
 // OsCall contains information about an OS-level operation from Python.
+//
+// Paths in Args are always absolute and lexically normalized: the interpreter
+// resolves a relative path against the working directory ([WithCwd]) before
+// the call leaves the sandbox.
 type OsCall struct {
 	Function string
 	Args     []any
@@ -161,6 +191,9 @@ type FutureResolver func(ctx context.Context, callIDs []uint32) (map[uint32]any,
 // several calls go out, all return Pending, and the host completes them in
 // whatever order it likes.
 //
+// An [OsCallFunc] may return Pending too, but only for "asyncio.sleep" (under
+// [SleepHost]), the one OS call the sandboxed code awaits.
+//
 // Returning Pending without a resolver configured is an error — nothing would
 // ever complete the call.
 //
@@ -184,7 +217,9 @@ type executeConfig struct {
 	futureResolver FutureResolver
 	limits         Limits
 	printFunc      func(string)
+	stderrFunc     func(string)
 	extFuncs       []FuncDef
+	run            runConfig
 }
 
 // WithExternalFunc sets the callback for external function calls.
@@ -260,11 +295,22 @@ func (r *Runner) Execute(ctx context.Context, code string, inputs map[string]any
 	// time races far ahead of the wall clock and Limits.MaxDuration fires
 	// almost immediately: a 10s limit would trip after ~120ms of real work.
 	// WithSysWalltime is the same story for datetime/time in Python.
+	//
+	// WithRandSource likewise replaces wazero's default, a *deterministic*
+	// byte stream: it backs WASI random_get, which is where an unseeded
+	// `random` generator draws its state, so without it every run would
+	// produce the same "random" numbers.
+	//
+	// The guest's stderr is kept (bounded) rather than discarded: when the
+	// instance traps, it is the only account of why. See guestTrapError.
+	stderr := &boundedBuffer{max: 4096}
 	mod, err := r.runtime.InstantiateModule(ctx, r.compiled,
 		wazero.NewModuleConfig().
 			WithName("").
 			WithSysNanotime().
-			WithSysWalltime())
+			WithSysWalltime().
+			WithRandSource(rand.Reader).
+			WithStderr(stderr))
 	if err != nil {
 		return nil, fmt.Errorf("montygo: failed to instantiate module: %w", err)
 	}
@@ -275,7 +321,58 @@ func (r *Runner) Execute(ctx context.Context, code string, inputs map[string]any
 		return nil, err
 	}
 
-	return inst.execute(ctx, code, inputs, cfg)
+	result, err := inst.execute(ctx, code, inputs, cfg)
+	if err != nil {
+		return nil, guestTrapError(err, stderr.String())
+	}
+	return result, nil
+}
+
+// guestTrapError explains a wasm-level failure from what the guest wrote to
+// stderr before it died.
+//
+// The interpreter raises MemoryError itself when a program crosses
+// Limits.MaxMemoryBytes at one of its checkpoints. An allocation large enough
+// to overshoot the allocator's hard ceiling (the limit plus headroom) between
+// checkpoints cannot raise anything — it happens below the interpreter — so
+// the allocator reports it on stderr and traps the instance. That is still
+// the program running out of memory, and it surfaces as the same MemoryError.
+// Any other trap (a panic, which also reports on stderr) keeps its error, with
+// the report attached.
+func guestTrapError(err error, stderr string) error {
+	var me *MontyError
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" || errors.As(err, &me) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if reason, ok := strings.CutPrefix(stderr, "monty worker: "); ok && strings.Contains(reason, "allocation of") {
+		return &MontyError{Message: "MemoryError: memory limit exceeded (" + reason + ")"}
+	}
+	return fmt.Errorf("%w (guest stderr: %s)", err, stderr)
+}
+
+// boundedBuffer is an io.Writer that keeps the first max bytes written to it
+// and drops the rest.
+type boundedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := b.max - len(b.buf); room > 0 {
+		b.buf = append(b.buf, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 // Close releases all WASM resources.

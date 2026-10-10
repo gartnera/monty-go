@@ -30,7 +30,9 @@ func run(t *testing.T, r *Runner, prog string, os OsCallFunc, opts ...ExecuteOpt
 // "'str' object has no attribute 'read'".
 func TestOpenReadWrite(t *testing.T) {
 	r := newRunner(t)
-	files := map[string]string{"data.txt": "line one\nline two\nline three\n"}
+	// Keyed by absolute path: the interpreter resolves "data.txt" against
+	// the working directory ("/" by default) before the call reaches here.
+	files := map[string]string{"/data.txt": "line one\nline two\nline three\n"}
 
 	handler := func(ctx context.Context, call *OsCall) (any, error) {
 		path, _ := call.Args[0].(string)
@@ -99,8 +101,8 @@ print(f.name, f.mode, f.closed)`, "data.txt r False"},
 		if _, err := run(t, r, `with open("out.txt", "w") as f: f.write("written")`, handler); err != nil {
 			t.Fatalf("execute: %v", err)
 		}
-		if files["out.txt"] != "written" {
-			t.Errorf("host file is %q, want %q", files["out.txt"], "written")
+		if files["/out.txt"] != "written" {
+			t.Errorf("host file is %q, want %q", files["/out.txt"], "written")
 		}
 	})
 }
@@ -234,7 +236,10 @@ func TestTypedReturnValues(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			out, err := run(t, r, c.prog, func(ctx context.Context, call *OsCall) (any, error) {
 				return c.ret, nil
-			})
+			},
+				// The clocks only ask the host under DateTimeHost; by default
+				// the sandbox reads the system clock itself.
+				WithOsPolicy(OsPolicy{DateTime: DateTimeHost}))
 			if err != nil {
 				t.Fatalf("execute: %v", err)
 			}
@@ -580,7 +585,7 @@ print(Path("f").read_text())`,
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
-	if !strings.Contains(err.Error(), "only external functions support") {
+	if !strings.Contains(err.Error(), "only external functions and asyncio.sleep support") {
 		t.Errorf("error should explain why, got: %v", err)
 	}
 }

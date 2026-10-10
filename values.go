@@ -32,7 +32,7 @@ import (
 // *sent*; only the ones JSON cannot carry faithfully arrive in OsCall.Args,
 // FunctionCall.Args or Execute's result:
 //
-//	Bytes, Date, DateTime, Time, TimeDelta, TimeZone, FileHandle,
+//	Bytes, Complex, Date, DateTime, Time, TimeDelta, TimeZone, FileHandle,
 //	BigInt (only past int64), TypeValue, BuiltinFunction, Function,
 //	Repr, Cycle, NotImplemented
 //
@@ -397,18 +397,27 @@ func (r Repr) MarshalJSON() ([]byte, error) {
 	return json.Marshal(tagged("repr", map[string]any{"repr": string(r)}))
 }
 
-// Cycle marks a value that referred back to itself while being converted, at
-// the given depth. It only ever arrives from Python; sending one is not
-// meaningful.
+// Cycle marks a reference back to an enclosing container, met while the value
+// was being converted. Repr is the placeholder its repr shows: "[...]",
+// "{...}" and so on. It only ever arrives from Python; sending one is not
+// meaningful, and the interpreter refuses it as an input.
 type Cycle struct {
-	Depth int
-	Repr  string
+	Repr string
 }
 
 // MarshalJSON implements [json.Marshaler].
 func (c Cycle) MarshalJSON() ([]byte, error) {
-	return json.Marshal(tagged("cycle", map[string]any{
-		"depth": c.Depth, "repr": c.Repr,
+	return json.Marshal(tagged("cycle", map[string]any{"repr": c.Repr}))
+}
+
+// Complex is Python `complex`. A bare complex128 cannot be sent — encoding/json
+// has no spelling for it — so convert: montygo.Complex(complex(1, 2)).
+type Complex complex128
+
+// MarshalJSON implements [json.Marshaler].
+func (c Complex) MarshalJSON() ([]byte, error) {
+	return json.Marshal(tagged("complex", map[string]any{
+		"real": real(c), "imag": imag(c),
 	}))
 }
 
@@ -638,7 +647,11 @@ func decodeTagged(kind string, m map[string]any) (any, bool) {
 	case "repr":
 		return Repr(str(m, "repr")), true
 	case "cycle":
-		return Cycle{Depth: num(m, "depth"), Repr: str(m, "repr")}, true
+		return Cycle{Repr: str(m, "repr")}, true
+	case "complex":
+		re, _ := m["real"].(float64)
+		im, _ := m["imag"].(float64)
+		return Complex(complex(re, im)), true
 	case "ellipsis":
 		return Ellipsis{}, true
 	case "notimplemented":
@@ -743,6 +756,8 @@ func plainValue(v any) any {
 		return string(v)
 	case Cycle:
 		return v.Repr
+	case Complex:
+		return map[string]any{"real": real(v), "imag": imag(v)}
 	case Ellipsis:
 		return "..."
 	case NotImplemented:

@@ -12,17 +12,22 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use monty::{FunctionCall, MontyRun, OsCall, ResolveFutures, RunProgress};
+use monty_types::unstable::{self, MontyNode};
 use monty_types::{
-    CompileOptions, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS, DictPairs, ExcType,
-    ExtFunctionResult, MontyDate, MontyDateTime, MontyException, MontyFileHandle, MontyObject,
-    MontyTime, MontyTimeDelta, MontyTimeZone, NameLookupResult, PrintWriter, PrintWriterCallback,
-    ResourceLimits, ResourceTracker, stat_result,
+    CallArgs, CompileOptions, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS, DateTimeSource, ExcType,
+    ExtFunctionResult, MontyDate, MontyDateTime, MontyException, MontyFileHandle, MontyObject, MontyTime,
+    MontyTimeDelta, MontyTimeZone, MontyType, NameLookupResult, ObjectRef, OsFunctionCall, OsPolicy, PrintWriter,
+    PrintWriterCallback, ProcessTime, RandomSeed, RandomStart, ResourceLimits, ResourceTracker, SandboxTimeZone,
+    SleepMode, memory_limit_with_headroom, stat_result,
 };
 use serde::{Deserialize, Serialize};
 
-/// monty enforces `max_memory` in the global allocator, so the limit only
-/// applies when this allocator is installed and armed via
-/// `monty_alloc::set_limit` before each run.
+/// monty enforces `max_memory` in two places: the interpreter raises
+/// `MemoryError` at its checkpoints once live usage crosses the soft limit,
+/// and this allocator traps the instance if the hard ceiling above it is
+/// crossed between checkpoints. Both read the live-byte count this allocator
+/// keeps, so it has to be installed for either to work, and armed via
+/// `monty_alloc::set_hard_limit` before each run.
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -32,13 +37,18 @@ use serde_json::Value as JsonValue;
 // MontyObject <-> serde_json::Value conversion
 // ---------------------------------------------------------------------------
 
-/// Convert MontyObject to a plain JSON value (not the tagged enum format).
-fn monty_to_json(obj: &MontyObject) -> JsonValue {
-    match obj {
-        MontyObject::None => JsonValue::Null,
-        MontyObject::Bool(b) => JsonValue::Bool(*b),
-        MontyObject::Int(i) => serde_json::json!(*i),
-        MontyObject::BigInt(bi) => {
+/// Convert a Monty value to a plain JSON value (not the tagged enum format).
+///
+/// Values are an arena of nodes (`MontyObject` is the arena plus its root),
+/// so this walks the nodes through monty's `unstable` view: the stable
+/// accessors cover only the common scalars and containers, and the bridge has
+/// to tell every kind apart.
+fn monty_to_json(obj: ObjectRef<'_>) -> JsonValue {
+    match unstable::node(obj) {
+        MontyNode::None => JsonValue::Null,
+        MontyNode::Bool(b) => JsonValue::Bool(*b),
+        MontyNode::Int(i) => serde_json::json!(*i),
+        MontyNode::BigInt(bi) => {
             // Fits in i64: a plain JSON number, which round-trips as an int.
             // Beyond that it is tagged, because a bare string would come back
             // as a `str` and silently stop being a number.
@@ -48,37 +58,37 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
                 tagged("bigint", [("value", JsonValue::String(bi.to_string()))])
             }
         }
-        MontyObject::Float(f) => serde_json::json!(*f),
-        MontyObject::String(s) => JsonValue::String(s.clone()),
+        MontyNode::Float(f) => serde_json::json!(*f),
+        // No JSON spelling, so tagged like the other typed values.
+        MontyNode::Complex(c) => tagged(
+            "complex",
+            [("real", serde_json::json!(c.real)), ("imag", serde_json::json!(c.imag))],
+        ),
+        MontyNode::String(s) => JsonValue::String(s.clone()),
         // Tagged, not a bare int array: a host servicing `Path.write_bytes`
         // or a binary write has to be able to tell `bytes` from a
         // `list[int]`, and an array alone cannot say which it was. The
         // payload is base64 rather than a list of decimal ints, which would
         // inflate a file roughly fourfold on its way through the JSON
         // boundary and count that against the run's memory limit.
-        MontyObject::Bytes(b) => tagged(
-            "bytes",
-            [("base64", JsonValue::String(BASE64.encode(b)))],
-        ),
-        MontyObject::List(items) => {
-            JsonValue::Array(items.iter().map(monty_to_json).collect())
+        MontyNode::Bytes(b) => tagged("bytes", [("base64", JsonValue::String(BASE64.encode(b)))]),
+        // A tuple, set and frozenset are plain arrays, like `list`. Tagging
+        // them would tell the host which it got, but at the cost of every
+        // existing handler that reads an argument as `[]any` — and upstream's
+        // own hosts see a list here too. A host that needs the distinction
+        // can still *send* a `tuple`; see the direction note on
+        // `json_to_tagged`.
+        MontyNode::List(_) | MontyNode::Tuple(_) | MontyNode::Set(_) | MontyNode::FrozenSet(_) => {
+            items_to_json(obj)
         }
-        // A plain array, like `list`. Tagging it would tell the host which of
-        // the two it got, but at the cost of every existing handler that
-        // reads an argument as `[]any` — and upstream's own hosts see a list
-        // here too. A host that needs the distinction can still *send* a
-        // `tuple`; see the direction note on `json_to_tagged`.
-        MontyObject::Tuple(items) => items_to_json(items),
-        MontyObject::Dict(pairs) => {
+        MontyNode::Dict(_) => {
+            let pairs = obj.pairs().unwrap_or_default();
             let mut map = serde_json::Map::new();
             let mut collides = false;
-            for (k, v) in pairs {
-                let key = match k {
-                    MontyObject::String(s) => s.clone(),
-                    other => format!("{:?}", other),
-                };
+            for (k, v) in &pairs {
+                let key = key_string(*k);
                 collides |= key == MONTY_TAG;
-                map.insert(key, monty_to_json(v));
+                map.insert(key, monty_to_json(*v));
             }
             // A guest dict is data, and it must not be able to impersonate a
             // typed value just by carrying the reserved key. One that does is
@@ -86,21 +96,20 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
             // real `bytes` or `Path` from sandboxed code claiming to be one.
             if collides {
                 let items = pairs
-                    .into_iter()
-                    .map(|(k, v)| JsonValue::Array(vec![monty_to_json(k), monty_to_json(v)]))
+                    .iter()
+                    .map(|(k, v)| JsonValue::Array(vec![monty_to_json(*k), monty_to_json(*v)]))
                     .collect();
                 return tagged("dict", [("items", JsonValue::Array(items))]);
             }
             JsonValue::Object(map)
         }
-        MontyObject::Set(items) | MontyObject::FrozenSet(items) => items_to_json(items),
-        MontyObject::Ellipsis => JsonValue::String("...".to_owned()),
+        MontyNode::Ellipsis => JsonValue::String("...".to_owned()),
         // A bare string. Every filesystem OS call carries a path as its first
         // argument, and a host reads it as one — tagging it would break that
         // for no benefit, since a handler uses the path rather than echoing
         // it back.
-        MontyObject::Path(p) => JsonValue::String(p.clone()),
-        MontyObject::Exception { exc_type, arg } => {
+        MontyNode::Path(p) => JsonValue::String(p.clone()),
+        MontyNode::Exception { exc_type, arg } => {
             let name: &'static str = exc_type.into();
             let mut map = serde_json::Map::new();
             map.insert("exception".to_owned(), JsonValue::String(name.to_owned()));
@@ -109,39 +118,32 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
             }
             JsonValue::Object(map)
         }
-        MontyObject::NamedTuple {
-            type_name,
-            field_names,
-            values,
+        MontyNode::NamedTuple {
+            type_name, field_names, ..
         } => {
             let mut map = serde_json::Map::new();
             map.insert("__type__".to_owned(), JsonValue::String(type_name.clone()));
-            for (name, val) in field_names.iter().zip(values.iter()) {
+            for (name, val) in field_names.iter().zip(obj.items().unwrap_or_default()) {
                 map.insert(name.clone(), monty_to_json(val));
             }
             JsonValue::Object(map)
         }
-        MontyObject::ClassInstance(instance) => {
+        MontyNode::ClassInstance { .. } => {
             let mut map = serde_json::Map::new();
-            map.insert(
-                "__type__".to_owned(),
-                JsonValue::String(instance.class_type.name.clone()),
-            );
+            map.insert("__type__".to_owned(), JsonValue::String(obj.type_name().to_owned()));
             // attrs preserve declaration order, so no field-name list is needed.
-            for (k, v) in instance.attrs.iter() {
-                if let MontyObject::String(key) = k {
-                    map.insert(key.clone(), monty_to_json(v));
+            for (k, v) in obj.pairs().unwrap_or_default() {
+                if let Some(key) = k.as_str() {
+                    map.insert(key.to_owned(), monty_to_json(v));
                 }
             }
             JsonValue::Object(map)
         }
         // Everything below has no plain-JSON spelling, so it crosses in the
         // same tagged form a host uses to send one in (see `json_to_tagged`).
-        // Before this existed these variants reached the host as a Rust
-        // `{:?}` debug string, which no caller could do anything with.
-        MontyObject::FileHandle(handle) => file_handle_to_json(handle),
-        MontyObject::NotImplemented => tagged("notimplemented", []),
-        MontyObject::Date(d) => tagged(
+        MontyNode::FileHandle(handle) => file_handle_to_json(handle),
+        MontyNode::NotImplemented => tagged("notimplemented", []),
+        MontyNode::Date(d) => tagged(
             "date",
             [
                 ("year", serde_json::json!(d.year)),
@@ -149,7 +151,7 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
                 ("day", serde_json::json!(d.day)),
             ],
         ),
-        MontyObject::DateTime(dt) => tagged(
+        MontyNode::DateTime(dt) => tagged(
             "datetime",
             [
                 ("year", serde_json::json!(dt.year)),
@@ -163,7 +165,7 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
                 ("timezone_name", opt_str(&dt.timezone_name)),
             ],
         ),
-        MontyObject::Time(t) => tagged(
+        MontyNode::Time(t) => tagged(
             "time",
             [
                 ("hour", serde_json::json!(t.hour)),
@@ -175,7 +177,7 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
                 ("fold", serde_json::json!(t.fold)),
             ],
         ),
-        MontyObject::TimeDelta(td) => tagged(
+        MontyNode::TimeDelta(td) => tagged(
             "timedelta",
             [
                 ("days", serde_json::json!(td.days)),
@@ -183,70 +185,70 @@ fn monty_to_json(obj: &MontyObject) -> JsonValue {
                 ("microseconds", serde_json::json!(td.microseconds)),
             ],
         ),
-        MontyObject::TimeZone(tz) => tagged(
+        MontyNode::TimeZone(tz) => tagged(
             "timezone",
             [
                 ("offset_seconds", serde_json::json!(tz.offset_seconds)),
                 ("name", opt_str(&tz.name)),
             ],
         ),
-        MontyObject::Type(ty) => {
-            let name: &'static str = ty.into();
-            tagged("type", [("name", JsonValue::String(name.to_owned()))])
+        MontyNode::Type(ty) => tagged("type", [("name", JsonValue::String(ty.name().to_owned()))]),
+        // A class defined by the sandboxed code. Named like a builtin type:
+        // the host can read which class it was, though sending the name back
+        // cannot recreate it.
+        MontyNode::ClassType(class) => tagged("type", [("name", JsonValue::String(class.name.clone()))]),
+        MontyNode::BuiltinFunction(func) => {
+            tagged("builtin", [("name", JsonValue::String(func.to_string()))])
         }
-        MontyObject::BuiltinFunction(func) => {
-            let name: &'static str = func.into();
-            tagged("builtin", [("name", JsonValue::String(name.to_owned()))])
-        }
-        MontyObject::Function { name, docstring } => tagged(
+        MontyNode::Function { name, docstring } => tagged(
             "function",
             [
                 ("name", JsonValue::String(name.clone())),
                 ("docstring", opt_str(docstring)),
             ],
         ),
-        MontyObject::Repr(repr) => tagged("repr", [("repr", JsonValue::String(repr.clone()))]),
-        // A cycle marker: the repr monty would print, plus the depth at which
-        // the value referred back to itself.
-        MontyObject::Cycle(depth, repr) => tagged(
-            "cycle",
-            [
-                ("depth", serde_json::json!(depth)),
-                ("repr", JsonValue::String(repr.clone())),
-            ],
-        ),
+        MontyNode::Repr(repr) => tagged("repr", [("repr", JsonValue::String(repr.clone()))]),
+        // A reference back to an enclosing container, as the placeholder its
+        // repr shows (`[...]`, `{...}`, ...).
+        MontyNode::Cycle(placeholder) => tagged("cycle", [("repr", JsonValue::String(placeholder.clone()))]),
+    }
+}
+
+/// A dict or kwargs key as a JSON object key: a string as itself, anything
+/// else as its Python repr.
+fn key_string(key: ObjectRef<'_>) -> String {
+    match key.as_str() {
+        Some(s) => s.to_owned(),
+        None => key.py_repr(),
     }
 }
 
 /// Convert a plain JSON value to a MontyObject.
 fn json_to_monty(val: &JsonValue) -> MontyObject {
     match val {
-        JsonValue::Null => MontyObject::None,
-        JsonValue::Bool(b) => MontyObject::Bool(*b),
+        JsonValue::Null => MontyObject::none(),
+        JsonValue::Bool(b) => MontyObject::bool(*b),
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
-                MontyObject::Int(i)
+                MontyObject::int(i)
             } else if let Some(f) = n.as_f64() {
-                MontyObject::Float(f)
+                MontyObject::float(f)
             } else {
-                MontyObject::None
+                MontyObject::none()
             }
         }
-        JsonValue::String(s) => MontyObject::String(s.clone()),
-        JsonValue::Array(items) => {
-            MontyObject::List(items.iter().map(json_to_monty).collect())
-        }
+        JsonValue::String(s) => MontyObject::string(s.clone()),
+        JsonValue::Array(items) => MontyObject::list(items.iter().map(json_to_monty)),
         JsonValue::Object(map) => {
             // A tagged object is a typed Monty value (bytes, datetime, a file
             // handle, ...); anything else is an ordinary dict.
             if let Some(obj) = json_to_tagged(map) {
                 return obj;
             }
-            let pairs: Vec<(MontyObject, MontyObject)> = map
-                .iter()
-                .map(|(k, v)| (MontyObject::String(k.clone()), json_to_monty(v)))
-                .collect();
-            MontyObject::Dict(DictPairs::from(pairs))
+            MontyObject::dict(
+                map.iter()
+                    .map(|(k, v)| (MontyObject::string(k.clone()), json_to_monty(v))),
+            )
         }
     }
 }
@@ -255,7 +257,7 @@ fn json_to_monty(val: &JsonValue) -> MontyObject {
 /// plain `dict`. Its value names the type; sibling keys carry the payload.
 ///
 /// JSON on its own can express only the handful of shapes that map to
-/// [`MontyObject`] one-for-one (null, bool, number, string, array, object), so
+/// a Python value one-for-one (null, bool, number, string, array, object), so
 /// without a tag a host could never hand the guest a `bytes`, a `datetime`, a
 /// `stat_result`, a file handle or an exception — the interpreter supports all
 /// of them, but they have no JSON spelling. This tag is that spelling.
@@ -294,9 +296,9 @@ fn opt_str(value: &Option<String>) -> JsonValue {
     }
 }
 
-/// A list of `MontyObject`s as a JSON array.
-fn items_to_json(items: &[MontyObject]) -> JsonValue {
-    JsonValue::Array(items.iter().map(monty_to_json).collect())
+/// The items of a sequence or set value as a JSON array.
+fn items_to_json(obj: ObjectRef<'_>) -> JsonValue {
+    JsonValue::Array(obj.items().unwrap_or_default().into_iter().map(monty_to_json).collect())
 }
 
 /// Wrap an optional i32 as a JSON value (`null` when absent).
@@ -318,11 +320,13 @@ fn opt_i32(value: Option<i32>) -> JsonValue {
 ///
 /// | kind | payload | becomes |
 /// |------|---------|---------|
-/// | `bytes` | `data`: array of 0-255 ints, **or** `text`: a string (encoded UTF-8) | `bytes` |
+/// | `bytes` | `base64`: a string, **or** `data`: array of 0-255 ints, **or** `text`: a string (encoded UTF-8) | `bytes` |
 /// | `tuple` / `set` / `frozenset` | `items`: array | `tuple` / `set` / `frozenset` |
+/// | `dict` | `items`: array of `[key, value]` pairs | `dict` (keys of any type) |
 /// | `namedtuple` | `type`: string, `fields`: array of `[name, value]` pairs | a named tuple |
 /// | `stat` | the `st_*` fields (`st_mode`, `st_size`, `st_mtime`, ...) | `os.stat_result` |
 /// | `path` | `path`: string | `pathlib.Path` |
+/// | `complex` | `real`, `imag` | `complex` |
 /// | `date` | `year`, `month`, `day` | `datetime.date` |
 /// | `datetime` | `year`..`microsecond`, optional `offset_seconds`, `timezone_name` | `datetime.datetime` |
 /// | `time` | `hour`..`microsecond`, optional `offset_seconds`, `timezone_name`, `fold` | `datetime.time` |
@@ -331,12 +335,14 @@ fn opt_i32(value: Option<i32>) -> JsonValue {
 /// | `exception` | `type`: an exception name, optional `message` | an exception *value* |
 /// | `bigint` | `value`: the digits as a string | an arbitrary-precision `int` |
 /// | `file` | `path`, `mode`, optional `position` | an `_io` file object |
-/// | `type` | `name`: a type name | a `type` |
+/// | `type` | `name`: a builtin type name | a `type` |
 /// | `builtin` | `name`: a builtin's name | a builtin function |
 /// | `function` | `name`, optional `docstring` | a function |
-/// | `repr` | `repr`: string | an opaque object with that repr |
 /// | `ellipsis` | — | `Ellipsis` |
 /// | `notimplemented` | — | `NotImplemented` |
+///
+/// `repr` and `cycle` only ever travel outwards: monty refuses either as an
+/// input, since neither stands for a real value.
 ///
 /// Raising an exception in the guest is a different thing from handing it this
 /// `exception` *value*: to make a host failure catchable Python, resume the
@@ -347,14 +353,14 @@ fn opt_i32(value: Option<i32>) -> JsonValue {
 ///
 /// Every form above is accepted *from* the host. The reverse direction
 /// ([`monty_to_json`]) is deliberately narrower: it tags only what JSON cannot
-/// carry faithfully — `bytes`, the `datetime` family, a file handle, an `int`
-/// past i64, and the type/builtin/function/repr values that used to cross as a
-/// Rust debug string. A `tuple`, `set`, `Path`, named tuple, exception value
-/// or `...` keeps its plain JSON shape on the way out, because a host reads
-/// those as the array, string or object they already look like — every
-/// filesystem OS call passes its path as a string — and tagging them would
-/// break that for no gain. So a host can send more shapes than it receives,
-/// which is the useful asymmetry: it is answering calls, not echoing them.
+/// carry faithfully — `bytes`, `complex`, the `datetime` family, a file
+/// handle, an `int` past i64, and the type/builtin/function/repr values. A
+/// `tuple`, `set`, `Path`, named tuple, exception value or `...` keeps its
+/// plain JSON shape on the way out, because a host reads those as the array,
+/// string or object they already look like — every filesystem OS call passes
+/// its path as a string — and tagging them would break that for no gain. So a
+/// host can send more shapes than it receives, which is the useful asymmetry:
+/// it is answering calls, not echoing them.
 fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObject> {
     let kind = map.get(MONTY_TAG)?.as_str()?;
 
@@ -369,6 +375,7 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
         map.get(key)
             .and_then(JsonValue::as_array)
             .map(|a| a.iter().map(json_to_monty).collect::<Vec<_>>())
+            .unwrap_or_default()
     };
 
     match kind {
@@ -376,19 +383,19 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
             // base64 is the form this bridge sends; `text` and `data` are
             // accepted conveniences for a host building one by hand.
             if let Some(encoded) = s("base64") {
-                return BASE64.decode(encoded).ok().map(MontyObject::Bytes);
+                return BASE64.decode(encoded).ok().map(MontyObject::bytes);
             }
             if let Some(text) = s("text") {
-                return Some(MontyObject::Bytes(text.as_bytes().to_vec()));
+                return Some(MontyObject::bytes(text.as_bytes().to_vec()));
             }
             let data = map.get("data")?.as_array()?;
             let mut out = Vec::with_capacity(data.len());
             for byte in data {
                 out.push(u8::try_from(byte.as_u64()?).ok()?);
             }
-            Some(MontyObject::Bytes(out))
+            Some(MontyObject::bytes(out))
         }
-        "tuple" => Some(MontyObject::Tuple(items("items").unwrap_or_default())),
+        "tuple" => Some(MontyObject::tuple(items("items"))),
         // The escape hatch for a guest dict that carries the reserved key
         // (see `monty_to_json`); also lets a host send a dict with non-string
         // keys, which a plain JSON object cannot express.
@@ -402,10 +409,10 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
                     json_to_monty(pair.get(1).unwrap_or(&JsonValue::Null)),
                 ));
             }
-            Some(MontyObject::Dict(DictPairs::from(out)))
+            Some(MontyObject::dict(out))
         }
-        "set" => Some(MontyObject::Set(items("items").unwrap_or_default())),
-        "frozenset" => Some(MontyObject::FrozenSet(items("items").unwrap_or_default())),
+        "set" => Some(MontyObject::set(items("items"))),
+        "frozenset" => Some(MontyObject::frozenset(items("items"))),
         "namedtuple" => {
             // Pairs, not an object: JSON objects have no defined key order and
             // a named tuple's fields are positional.
@@ -417,11 +424,11 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
                 field_names.push(pair.first()?.as_str()?.to_owned());
                 values.push(json_to_monty(pair.get(1).unwrap_or(&JsonValue::Null)));
             }
-            Some(MontyObject::NamedTuple {
-                type_name: opt_string("type").unwrap_or_else(|| "namedtuple".to_owned()),
+            Some(MontyObject::named_tuple(
+                opt_string("type").unwrap_or_else(|| "namedtuple".to_owned()),
                 field_names,
                 values,
-            })
+            ))
         }
         // `stat_result` builds the exact named tuple `Path.stat()` must return,
         // so a host does not have to know its field order.
@@ -437,13 +444,14 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
             f("st_mtime").unwrap_or(0.0),
             f("st_ctime").unwrap_or(0.0),
         )),
-        "path" => Some(MontyObject::Path(opt_string("path")?)),
-        "date" => Some(MontyObject::Date(MontyDate {
+        "path" => Some(MontyObject::path(opt_string("path")?)),
+        "complex" => Some(MontyObject::complex(f("real").unwrap_or(0.0), f("imag").unwrap_or(0.0))),
+        "date" => Some(MontyObject::date(MontyDate {
             year: i32::try_from(i("year")?).ok()?,
             month: u8::try_from(u("month")?).ok()?,
             day: u8::try_from(u("day")?).ok()?,
         })),
-        "datetime" => Some(MontyObject::DateTime(MontyDateTime {
+        "datetime" => Some(MontyObject::datetime(MontyDateTime {
             year: i32::try_from(i("year")?).ok()?,
             month: u8::try_from(u("month")?).ok()?,
             day: u8::try_from(u("day")?).ok()?,
@@ -454,7 +462,7 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
             offset_seconds: i("offset_seconds").and_then(|v| i32::try_from(v).ok()),
             timezone_name: opt_string("timezone_name"),
         })),
-        "time" => Some(MontyObject::Time(MontyTime {
+        "time" => Some(MontyObject::time(MontyTime {
             hour: u8::try_from(u("hour").unwrap_or(0)).ok()?,
             minute: u8::try_from(u("minute").unwrap_or(0)).ok()?,
             second: u8::try_from(u("second").unwrap_or(0)).ok()?,
@@ -463,75 +471,59 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
             timezone_name: opt_string("timezone_name"),
             fold: u8::try_from(u("fold").unwrap_or(0)).ok()?,
         })),
-        "timedelta" => Some(MontyObject::TimeDelta(MontyTimeDelta {
+        "timedelta" => Some(MontyObject::timedelta(MontyTimeDelta {
             days: i32::try_from(i("days").unwrap_or(0)).ok()?,
             seconds: i32::try_from(i("seconds").unwrap_or(0)).ok()?,
             microseconds: i32::try_from(i("microseconds").unwrap_or(0)).ok()?,
         })),
-        "timezone" => Some(MontyObject::TimeZone(MontyTimeZone {
+        "timezone" => Some(MontyObject::timezone(MontyTimeZone {
             offset_seconds: i32::try_from(i("offset_seconds").unwrap_or(0)).ok()?,
             name: opt_string("name"),
         })),
-        "exception" => Some(MontyObject::Exception {
-            exc_type: s("type")?.parse().ok()?,
-            arg: opt_string("message"),
-        }),
-        "bigint" => Some(MontyObject::BigInt(s("value")?.parse().ok()?)),
-        "file" => Some(MontyObject::FileHandle(MontyFileHandle {
+        "exception" => Some(MontyObject::exception(s("type")?.parse().ok()?, opt_string("message"))),
+        "bigint" => Some(MontyObject::bigint(s("value")?.parse().ok()?)),
+        "file" => Some(MontyObject::file_handle(MontyFileHandle {
             path: opt_string("path")?,
             mode: s("mode")?.parse().ok()?,
             position: u("position").unwrap_or(0),
         })),
-        "type" => Some(MontyObject::Type(s("name")?.parse().ok()?)),
-        "builtin" => Some(MontyObject::BuiltinFunction(s("name")?.parse().ok()?)),
-        "function" => Some(MontyObject::Function {
-            name: opt_string("name")?,
-            docstring: opt_string("docstring"),
-        }),
-        "repr" => Some(MontyObject::Repr(opt_string("repr")?)),
-        "ellipsis" => Some(MontyObject::Ellipsis),
-        "notimplemented" => Some(MontyObject::NotImplemented),
+        "type" => Some(MontyObject::type_object(MontyType::from_type_name(s("name")?)?)),
+        "builtin" => MontyObject::builtin_function_from_name(s("name")?),
+        "function" => Some(MontyObject::function(opt_string("name")?, opt_string("docstring"))),
+        "ellipsis" => Some(MontyObject::ellipsis()),
+        "notimplemented" => Some(MontyObject::not_implemented()),
         _ => None,
     }
 }
 
-fn monty_args_to_json(args: &[MontyObject]) -> JsonValue {
-    JsonValue::Array(args.iter().map(monty_to_json).collect())
+/// An OS call's positional arguments as a JSON array.
+fn call_args_to_json(args: &CallArgs) -> JsonValue {
+    JsonValue::Array(args.args().map(monty_to_json).collect())
 }
 
-fn monty_kwargs_to_json(kwargs: &[(MontyObject, MontyObject)]) -> JsonValue {
+/// An OS call's keyword arguments as a JSON object.
+fn call_kwargs_to_json(args: &CallArgs) -> JsonValue {
     let mut map = serde_json::Map::new();
-    for (k, v) in kwargs {
-        let key = match k {
-            MontyObject::String(s) => s.clone(),
-            other => format!("{:?}", other),
-        };
-        map.insert(key, monty_to_json(v));
+    for (k, v) in args.kwargs() {
+        map.insert(key_string(k), monty_to_json(v));
     }
     JsonValue::Object(map)
 }
 
 /// Merge positional args and kwargs into a single JSON object.
 /// Positional args are mapped to parameter names by index.
-fn merge_args(
-    func_name: &str,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-    param_registry: &HashMap<String, Vec<String>>,
-) -> JsonValue {
+fn merge_args(func_name: &str, args: &CallArgs, param_registry: &HashMap<String, Vec<String>>) -> JsonValue {
     let mut map = serde_json::Map::new();
     // Map positional args to parameter names.
     if let Some(param_names) = param_registry.get(func_name) {
-        for (i, arg) in args.iter().enumerate() {
-            if i < param_names.len() {
-                map.insert(param_names[i].clone(), monty_to_json(arg));
-            }
+        for (name, arg) in param_names.iter().zip(args.args()) {
+            map.insert(name.clone(), monty_to_json(arg));
         }
     }
     // Merge kwargs (overrides positional — Python semantics).
-    for (k, v) in kwargs {
-        if let MontyObject::String(key) = k {
-            map.insert(key.clone(), monty_to_json(v));
+    for (k, v) in args.kwargs() {
+        if let Some(key) = k.as_str() {
+            map.insert(key.to_owned(), monty_to_json(v));
         }
     }
     JsonValue::Object(map)
@@ -595,8 +587,7 @@ where
     F: FnOnce(&HashMap<String, Vec<String>>) -> R,
 {
     let guard = PARAM_REGISTRY.lock().unwrap();
-    static EMPTY: std::sync::LazyLock<HashMap<String, Vec<String>>> =
-        std::sync::LazyLock::new(HashMap::new);
+    static EMPTY: std::sync::LazyLock<HashMap<String, Vec<String>>> = std::sync::LazyLock::new(HashMap::new);
     let registry = guard.as_ref().unwrap_or(&EMPTY);
     f(registry)
 }
@@ -620,7 +611,7 @@ fn set_result_json<T: Serialize>(value: &T) {
 // JSON wire types (using plain JSON values, not MontyObject tagged enums)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct ProgressResult {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -639,12 +630,17 @@ struct ProgressResult {
     call_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     method_call: Option<bool>,
+    /// Set on an OS call the host may answer with a future (`asyncio.sleep`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    accepts_future: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_call_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    print_output: Option<String>,
+    /// Everything printed since the previous suspension, in order, as
+    /// `[stream, text]` pairs (`stream` is `"stdout"` or `"stderr"`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    output: Vec<(&'static str, String)>,
 }
 
 #[derive(Deserialize, Default)]
@@ -656,36 +652,198 @@ struct LimitsInput {
     max_allocations: Option<usize>,
     #[serde(default)]
     max_suspensions: Option<usize>,
+    /// Execution time for the whole run, excluding time suspended on the host.
     #[serde(default)]
     max_duration_ms: Option<u64>,
+    /// Execution time between two host round trips.
+    #[serde(default)]
+    max_turn_duration_ms: Option<u64>,
     #[serde(default)]
     max_memory: Option<usize>,
     #[serde(default)]
     max_recursion_depth: Option<usize>,
+    /// Cumulative system sleep. Stored on the tracker for completeness; the
+    /// host performs the sleeps, so it is the host that enforces it.
+    #[serde(default)]
+    max_total_sleep_ms: Option<u64>,
+}
+
+/// Per-run configuration set between compile and start (see `monty_configure`).
+#[derive(Deserialize, Default)]
+struct ConfigureInput {
+    /// The sandbox working directory: what `os.getcwd()` reports and what
+    /// relative paths resolve against before an OS call reaches the host.
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    os_policy: Option<OsPolicyInput>,
+}
+
+/// The host's choices for clocks, sleeps and random state; see [`OsPolicy`].
+/// Every field is optional and falls back to monty's default.
+#[derive(Deserialize, Default)]
+struct OsPolicyInput {
+    #[serde(default)]
+    datetime: Option<DateTimeInput>,
+    #[serde(default)]
+    timezone: Option<TimeZoneInput>,
+    #[serde(default)]
+    sleep: Option<SleepInput>,
+    /// `"zero"` (default) or `"elapsed"`.
+    #[serde(default)]
+    process_time: Option<String>,
+    #[serde(default)]
+    random: Option<RandomInput>,
+}
+
+/// `{"kind": "system" | "host" | "fixed", "unix_seconds", "microsecond"}`.
+#[derive(Deserialize)]
+struct DateTimeInput {
+    kind: String,
+    #[serde(default)]
+    unix_seconds: i64,
+    #[serde(default)]
+    microsecond: u32,
+}
+
+/// `{"name": "Europe/London"}` for an IANA zone, or `{"offset_seconds", "name"}`
+/// for a fixed offset.
+#[derive(Deserialize)]
+struct TimeZoneInput {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    offset_seconds: Option<i32>,
+}
+
+/// `{"kind": "system", "max_ms"}`, `{"kind": "host"}` or `{"kind": "zero"}`.
+#[derive(Deserialize)]
+struct SleepInput {
+    kind: String,
+    #[serde(default)]
+    max_ms: Option<u64>,
+}
+
+/// `{"kind": "system" | "host"}`, or `{"kind": "seed", ...}` with exactly one
+/// of `int` (digits, any size), `float`, `str` or `bytes` (base64).
+#[derive(Deserialize)]
+struct RandomInput {
+    kind: String,
+    #[serde(default)]
+    int: Option<String>,
+    #[serde(default)]
+    float: Option<f64>,
+    #[serde(default)]
+    str: Option<String>,
+    #[serde(default)]
+    bytes: Option<String>,
+}
+
+impl OsPolicyInput {
+    /// Builds the policy, or a message naming the field it could not accept.
+    fn into_policy(self) -> Result<OsPolicy, String> {
+        let mut policy = OsPolicy::default();
+        if let Some(dt) = self.datetime {
+            policy.datetime = match dt.kind.as_str() {
+                "system" => DateTimeSource::System,
+                "host" => DateTimeSource::CallHost,
+                "fixed" => DateTimeSource::Fixed {
+                    unix_seconds: dt.unix_seconds,
+                    microsecond: dt.microsecond,
+                },
+                other => return Err(format!("unknown datetime source {other:?}")),
+            };
+        }
+        if let Some(tz) = self.timezone {
+            policy.timezone = match (tz.offset_seconds, tz.name) {
+                (Some(offset_seconds), name) => SandboxTimeZone::Fixed { offset_seconds, name },
+                (None, Some(name)) => SandboxTimeZone::named(&name).map_err(|e| e.to_string())?,
+                (None, None) => SandboxTimeZone::utc(),
+            };
+        }
+        if let Some(sleep) = self.sleep {
+            policy.sleep = match sleep.kind.as_str() {
+                "system" => SleepMode::System(
+                    sleep.max_ms.map_or(SleepMode::DEFAULT_MAX, Duration::from_millis),
+                ),
+                "host" => SleepMode::CallHost,
+                "zero" => SleepMode::Zero,
+                other => return Err(format!("unknown sleep mode {other:?}")),
+            };
+        }
+        if let Some(process_time) = self.process_time {
+            policy.process_time = match process_time.as_str() {
+                "zero" => ProcessTime::Zero,
+                "elapsed" => ProcessTime::Elapsed,
+                other => return Err(format!("unknown process_time {other:?}")),
+            };
+        }
+        if let Some(random) = self.random {
+            policy.random_start = match random.kind.as_str() {
+                "system" => RandomStart::System,
+                "host" => RandomStart::CallHost,
+                "seed" => RandomStart::Seed(match (random.int, random.float, random.str, random.bytes) {
+                    (Some(digits), None, None, None) => {
+                        RandomSeed::Int(digits.parse().map_err(|_| format!("invalid int seed {digits:?}"))?)
+                    }
+                    (None, Some(f), None, None) => RandomSeed::Float(f),
+                    (None, None, Some(s), None) => RandomSeed::Str(s),
+                    (None, None, None, Some(b)) => {
+                        RandomSeed::Bytes(BASE64.decode(b).map_err(|_| "invalid base64 bytes seed".to_owned())?)
+                    }
+                    _ => return Err("a random seed needs exactly one of int, float, str or bytes".to_owned()),
+                }),
+                other => return Err(format!("unknown random start {other:?}")),
+            };
+        }
+        Ok(policy)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Print writer that collects output
 // ---------------------------------------------------------------------------
 
+/// Collects print output as ordered `(stream, text)` runs, so stdout and
+/// stderr written in the same turn reach the host interleaved as they were
+/// printed.
 struct CollectPrintWriter {
-    buf: String,
+    entries: Vec<(&'static str, String)>,
 }
 
 impl CollectPrintWriter {
     fn new() -> Self {
-        Self { buf: String::new() }
+        Self { entries: Vec::new() }
+    }
+
+    /// The run of `stream` to append to, starting a new one when the stream
+    /// changes.
+    fn run(&mut self, stream: &'static str) -> &mut String {
+        if self.entries.last().map(|(s, _)| *s) != Some(stream) {
+            self.entries.push((stream, String::new()));
+        }
+        &mut self.entries.last_mut().expect("just pushed").1
     }
 }
 
 impl PrintWriterCallback for CollectPrintWriter {
     fn stdout_write(&mut self, output: Cow<'_, str>) -> Result<(), MontyException> {
-        self.buf.push_str(&output);
+        self.run("stdout").push_str(&output);
         Ok(())
     }
 
     fn stdout_push(&mut self, end: char) -> Result<(), MontyException> {
-        self.buf.push(end);
+        self.run("stdout").push(end);
+        Ok(())
+    }
+
+    fn stderr_write(&mut self, output: Cow<'_, str>) -> Result<(), MontyException> {
+        self.run("stderr").push_str(&output);
+        Ok(())
+    }
+
+    fn stderr_push(&mut self, end: char) -> Result<(), MontyException> {
+        self.run("stderr").push(end);
         Ok(())
     }
 }
@@ -694,34 +852,15 @@ impl PrintWriterCallback for CollectPrintWriter {
 // RunProgress -> ProgressResult conversion
 // ---------------------------------------------------------------------------
 
-fn progress_to_result(
-    progress: RunProgress,
-    print_output: String,
-    param_registry: &HashMap<String, Vec<String>>,
-) -> ProgressResult {
-    let print_out = if print_output.is_empty() {
-        None
-    } else {
-        Some(print_output)
-    };
-
+fn progress_to_result(progress: RunProgress, param_registry: &HashMap<String, Vec<String>>) -> ProgressResult {
     match progress {
         RunProgress::Complete(value) => ProgressResult {
             status: "complete",
-            value: Some(monty_to_json(&value)),
-            print_output: print_out,
-            snapshot_handle: None,
-            function_name: None,
-            os_function: None,
-            args: None,
-            kwargs: None,
-            call_id: None,
-            method_call: None,
-            pending_call_ids: None,
-            error: None,
+            value: Some(monty_to_json(value.as_ref())),
+            ..Default::default()
         },
         RunProgress::FunctionCall(call) => {
-            let merged = merge_args(&call.function_name, &call.args, &call.kwargs, param_registry);
+            let merged = merge_args(&call.function_name, &call.args, param_registry);
             let function_name = call.function_name.clone();
             let call_id = call.call_id;
             let method_call = call.object_id.is_some();
@@ -732,26 +871,21 @@ fn progress_to_result(
             });
             ProgressResult {
                 status: "function_call",
-                value: None,
                 snapshot_handle: Some(handle),
                 function_name: Some(function_name),
-                os_function: None,
                 args: Some(merged),
-                kwargs: None,
                 call_id: Some(call_id),
                 method_call: Some(method_call),
-                pending_call_ids: None,
-                error: None,
-                print_output: print_out,
+                ..Default::default()
             }
         }
         RunProgress::OsCall(call) => {
-            let (pos_args, kw_args) = call.function_call.clone().to_args();
-            let args_json = monty_args_to_json(&pos_args);
-            let kwargs_json = monty_kwargs_to_json(&kw_args);
-            let function_name: &'static str = (&call.function_call).into();
-            let function_str = function_name.to_string();
+            // Paths in the projection are already absolute (relative ones are
+            // resolved against the sandbox cwd) and lexically normalized.
+            let args = call.function_call.clone().to_args();
+            let function_name = call.function_call.name();
             let call_id = call.call_id;
+            let accepts_future = OsFunctionCall::accepts_future(function_name);
             let handle = with_state(|s| {
                 let h = s.next_handle();
                 s.snapshots.insert(h, SnapshotState::OsCall(call));
@@ -759,17 +893,13 @@ fn progress_to_result(
             });
             ProgressResult {
                 status: "os_call",
-                value: None,
                 snapshot_handle: Some(handle),
-                function_name: None,
-                os_function: Some(function_str),
-                args: Some(args_json),
-                kwargs: Some(kwargs_json),
+                os_function: Some(function_name.to_owned()),
+                args: Some(call_args_to_json(&args)),
+                kwargs: Some(call_kwargs_to_json(&args)),
                 call_id: Some(call_id),
-                method_call: None,
-                pending_call_ids: None,
-                error: None,
-                print_output: print_out,
+                accepts_future,
+                ..Default::default()
             }
         }
         RunProgress::ResolveFutures(state) => {
@@ -781,37 +911,17 @@ fn progress_to_result(
             });
             ProgressResult {
                 status: "resolve_futures",
-                value: None,
                 snapshot_handle: Some(handle),
-                function_name: None,
-                os_function: None,
-                args: None,
-                kwargs: None,
-                call_id: None,
-                method_call: None,
                 pending_call_ids: Some(pending),
-                error: None,
-                print_output: print_out,
+                ..Default::default()
             }
         }
         // NameLookup should be resolved internally by `drive_progress` before
         // reaching this point. If one slips through we treat it as an error.
         RunProgress::NameLookup(lookup) => ProgressResult {
             status: "error",
-            value: None,
-            snapshot_handle: None,
-            function_name: None,
-            os_function: None,
-            args: None,
-            kwargs: None,
-            call_id: None,
-            method_call: None,
-            pending_call_ids: None,
-            error: Some(format!(
-                "internal error: unhandled name lookup for '{}'",
-                lookup.name
-            )),
-            print_output: print_out,
+            error: Some(format!("internal error: unhandled name lookup for '{}'", lookup.name)),
+            ..Default::default()
         },
     }
 }
@@ -819,8 +929,8 @@ fn progress_to_result(
 /// Drives a RunProgress chain, auto-resolving NameLookup events against the
 /// registered external function set. Returns a `(status_code, ProgressResult)`
 /// pair suitable for the WASM wire format. NameLookup events whose name is
-/// present in `param_registry` resolve to a `MontyObject::Function`; unknown
-/// names resolve to `Undefined`, which the VM surfaces as `NameError`.
+/// present in `param_registry` resolve to a host function; unknown names
+/// resolve to `Undefined`, which the VM surfaces as `NameError`.
 fn drive_progress(
     mut result: Result<RunProgress, MontyException>,
     print_writer: &mut CollectPrintWriter,
@@ -830,10 +940,7 @@ fn drive_progress(
         match result {
             Ok(RunProgress::NameLookup(lookup)) => {
                 let nlr = if param_registry.contains_key(&lookup.name) {
-                    NameLookupResult::Value(MontyObject::Function {
-                        name: lookup.name.clone(),
-                        docstring: None,
-                    })
+                    NameLookupResult::Value(MontyObject::function(lookup.name.clone(), None))
                 } else {
                     NameLookupResult::Undefined
                 };
@@ -843,19 +950,16 @@ fn drive_progress(
             // A call to a name that's not a registered external function is a
             // NameError — monty's bytecode compiler emits `LoadGlobalCallable`
             // / `LoadLocalCallable` which bypass `NameLookup` and yield a
-            // `FunctionCall` directly, so we have to catch the undeclared case
-            // here and auto-resume with a NameError exception.
+            // `FunctionCall` directly, so the undeclared case is caught here
+            // and answered with `NotFound`, which raises that NameError.
             Ok(RunProgress::FunctionCall(call)) if !param_registry.contains_key(&call.function_name) => {
-                let exc = MontyException::new(
-                    ExcType::NameError,
-                    Some(format!("name '{}' is not defined", call.function_name)),
-                );
+                let name = call.function_name.clone();
                 let pw = PrintWriter::Callback(print_writer);
-                result = call.resume(ExtFunctionResult::Error(exc), pw);
+                result = call.resume(ExtFunctionResult::NotFound(name), pw);
             }
             Ok(progress) => {
-                let print_output = print_writer.buf.clone();
-                let pr = progress_to_result(progress, print_output, param_registry);
+                let mut pr = progress_to_result(progress, param_registry);
+                pr.output = std::mem::take(&mut print_writer.entries);
                 let status = match pr.status {
                     "complete" => 1,
                     "function_call" => 2,
@@ -866,36 +970,23 @@ fn drive_progress(
                 return (status, pr);
             }
             Err(e) => {
-                let print_output = print_writer.buf.clone();
-                return (0, error_result(&e, print_output));
+                let mut pr = error_result(&e);
+                pr.output = std::mem::take(&mut print_writer.entries);
+                return (0, pr);
             }
         }
     }
 }
 
-fn error_result(err: &MontyException, print_output: String) -> ProgressResult {
-    str_error_result(&format!("{err}"), print_output)
+fn error_result(err: &MontyException) -> ProgressResult {
+    str_error_result(&format!("{err}"))
 }
 
-fn str_error_result(msg: &str, print_output: String) -> ProgressResult {
-    let print_out = if print_output.is_empty() {
-        None
-    } else {
-        Some(print_output)
-    };
+fn str_error_result(msg: &str) -> ProgressResult {
     ProgressResult {
         status: "error",
-        value: None,
-        snapshot_handle: None,
-        function_name: None,
-        os_function: None,
-        args: None,
-        kwargs: None,
-        call_id: None,
-        method_call: None,
-        pending_call_ids: None,
         error: Some(msg.to_owned()),
-        print_output: print_out,
+        ..Default::default()
     }
 }
 
@@ -953,18 +1044,10 @@ pub extern "C" fn monty_result_read(buf_ptr: u32, buf_cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn monty_check() -> u32 {
     let result = std::panic::catch_unwind(|| {
-        let runner = MontyRun::new(
-            "x + 1".to_owned(),
-            "check.py",
-            vec!["x".to_owned()],
-            CompileOptions::default(),
-        )
-            .ok()?;
-        let result = runner.run_no_limits(vec![MontyObject::Int(41)]).ok()?;
-        match result {
-            MontyObject::Int(v) => Some(v as u32),
-            _ => None,
-        }
+        let mut runner =
+            MontyRun::new("x + 1".to_owned(), "check.py", vec!["x".to_owned()], CompileOptions::default()).ok()?;
+        let result = runner.run_no_limits(vec![MontyObject::int(41)]).ok()?;
+        result.as_ref().as_int().map(|v| v as u32)
     });
     match result {
         Ok(Some(v)) => v,
@@ -994,54 +1077,57 @@ fn parse_inputs(json_str: &str) -> Vec<MontyObject> {
     values.iter().map(json_to_monty).collect()
 }
 
-/// Turn a host's JSON reply into the result the interpreter resumes with.
+/// A host's JSON reply, as the result the interpreter resumes with.
+enum HostReply {
+    /// Resume normally with a value or a raised exception.
+    Result(ExtFunctionResult),
+    /// Service the call asynchronously; see `monty_resume`.
+    Future,
+    /// End the run with an exception sandboxed code cannot catch.
+    Abort(MontyException),
+}
+
+/// Turn a host's JSON reply into what the interpreter resumes with.
 ///
 /// Normally that is [`ExtFunctionResult::Return`] carrying the converted value.
-/// The exception is the tagged `"raise"` form —
-/// `{"__monty__": "raise", "type": "FileNotFoundError", "message": "..."}` —
-/// which resumes with [`ExtFunctionResult::Error`] so the guest sees a real
-/// Python exception it can `try`/`except`. Without it a host that cannot
-/// service a call had no way to say so: the only options were to return a
-/// value the guest would misread, or to tear the whole run down.
+/// The tagged forms say otherwise:
+///
+/// - `{"__monty__": "raise", "type": "FileNotFoundError", "message": "..."}`
+///   resumes with [`ExtFunctionResult::Error`], so the guest sees a real
+///   Python exception it can `try`/`except`. Without it a host that cannot
+///   service a call had no way to say so: the only options were to return a
+///   value the guest would misread, or to tear the whole run down.
+/// - `{"__monty__": "abort", "type": ..., "message": ...}` ends the run with
+///   that exception at the call site, uncatchably, with a traceback — for a
+///   host limit (a sleep budget) that must not be swallowed by a bare
+///   `except`.
+/// - `{"__monty__": "future"}` leaves the call pending.
 ///
 /// An unparseable `type` falls back to `OSError` rather than being returned as
 /// a value, because a reply asking to raise must never resume as a success.
-fn parse_ext_result(json_str: &str) -> ExtFunctionResult {
+fn parse_host_reply(json_str: &str) -> HostReply {
     if json_str.is_empty() {
-        return ExtFunctionResult::Return(MontyObject::None);
+        return HostReply::Result(ExtFunctionResult::Return(MontyObject::none()));
     }
     let value: JsonValue = serde_json::from_str(json_str).unwrap_or(JsonValue::Null);
     if let Some(map) = value.as_object() {
-        if map.get(MONTY_TAG).and_then(JsonValue::as_str) == Some("future") {
-            // Marked so `monty_resume` can turn it into
-            // `ExtFunctionResult::Future` with the call id it holds; nothing
-            // else should ever see this sentinel as a value.
-            return ExtFunctionResult::Return(MontyObject::Repr(FUTURE_SENTINEL.to_owned()));
-        }
-        if map.get(MONTY_TAG).and_then(JsonValue::as_str) == Some("raise") {
+        let exception = || {
             let exc_type = map
                 .get("type")
                 .and_then(JsonValue::as_str)
                 .and_then(|name| name.parse::<ExcType>().ok())
                 .unwrap_or(ExcType::OSError);
-            let message = map
-                .get("message")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned);
-            return ExtFunctionResult::Error(MontyException::new(exc_type, message));
+            let message = map.get("message").and_then(JsonValue::as_str).map(str::to_owned);
+            MontyException::new(exc_type, message)
+        };
+        match map.get(MONTY_TAG).and_then(JsonValue::as_str) {
+            Some("future") => return HostReply::Future,
+            Some("raise") => return HostReply::Result(ExtFunctionResult::Error(exception())),
+            Some("abort") => return HostReply::Abort(exception()),
+            _ => {}
         }
     }
-    ExtFunctionResult::Return(json_to_monty(&value))
-}
-
-/// Marker `parse_ext_result` leaves behind for a `"future"` reply, recognised
-/// by [`is_future_request`]. It is deliberately an implausible repr string so
-/// it cannot collide with a value a host meant to return.
-const FUTURE_SENTINEL: &str = "\u{0}__monty_future__";
-
-/// Whether a parsed result is the future marker rather than a real value.
-fn is_future_request(result: &ExtFunctionResult) -> bool {
-    matches!(result, ExtFunctionResult::Return(MontyObject::Repr(r)) if r == FUTURE_SENTINEL)
+    HostReply::Result(ExtFunctionResult::Return(json_to_monty(&value)))
 }
 
 /// Compile Python code. Returns a runner handle (>0) on success, 0 on error.
@@ -1090,10 +1176,58 @@ pub extern "C" fn monty_compile(
             handle
         }),
         Err(e) => {
-            set_result_json(&error_result(&e, String::new()));
+            set_result_json(&error_result(&e));
             0
         }
     }
+}
+
+/// Configure a compiled runner before it starts: its working directory and
+/// its OS policy (clocks, sleeps, random state). Returns 1 on success, 0 on
+/// error with the message in the result buffer.
+#[no_mangle]
+pub extern "C" fn monty_configure(runner_handle: u32, config_ptr: u32, config_len: u32) -> u32 {
+    let config_json = unsafe { read_str(config_ptr, config_len) };
+    let config: ConfigureInput = if config_json.is_empty() {
+        ConfigureInput::default()
+    } else {
+        match serde_json::from_str(&config_json) {
+            Ok(config) => config,
+            Err(e) => {
+                set_result_json(&str_error_result(&format!("invalid configuration: {e}")));
+                return 0;
+            }
+        }
+    };
+    let policy = match config.os_policy.map(OsPolicyInput::into_policy).transpose() {
+        Ok(policy) => policy,
+        Err(e) => {
+            set_result_json(&str_error_result(&format!("invalid os policy: {e}")));
+            return 0;
+        }
+    };
+    if let Some(cwd) = &config.cwd {
+        if let Err(e) = monty_types::validate_cwd(cwd) {
+            set_result_json(&str_error_result(&format!("invalid {e}")));
+            return 0;
+        }
+    }
+
+    with_state(|s| {
+        let Some(runner) = s.runners.remove(&runner_handle) else {
+            set_result_json(&str_error_result("invalid runner handle"));
+            return 0;
+        };
+        let mut runner = match policy {
+            Some(policy) => runner.with_os_policy(policy),
+            None => runner,
+        };
+        if let Some(cwd) = &config.cwd {
+            runner.set_cwd(cwd);
+        }
+        s.runners.insert(runner_handle, runner);
+        1
+    })
 }
 
 /// Start execution. Returns a status code:
@@ -1110,7 +1244,7 @@ pub extern "C" fn monty_start(
     let runner = match runner {
         Some(r) => r,
         None => {
-            set_result_json(&str_error_result("invalid runner handle", String::new()));
+            set_result_json(&str_error_result("invalid runner handle"));
             return 0;
         }
     };
@@ -1128,19 +1262,19 @@ pub extern "C" fn monty_start(
     };
 
     let resource_limits = ResourceLimits {
-        max_duration: limits_input.max_duration_ms.map(Duration::from_millis),
+        max_feed_duration: limits_input.max_duration_ms.map(Duration::from_millis),
+        max_turn_duration: limits_input.max_turn_duration_ms.map(Duration::from_millis),
         max_memory: limits_input.max_memory,
         gc_interval: None,
-        max_recursion_depth: limits_input
-            .max_recursion_depth
-            .unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),
-        max_suspensions: limits_input
-            .max_suspensions
-            .unwrap_or(DEFAULT_MAX_SUSPENSIONS),
+        max_recursion_depth: limits_input.max_recursion_depth.unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),
+        max_suspensions: limits_input.max_suspensions.unwrap_or(DEFAULT_MAX_SUSPENSIONS),
+        max_total_sleep: limits_input.max_total_sleep_ms.map(Duration::from_millis),
     };
-    // max_memory is enforced by the allocator, not the VM: without arming
-    // monty-alloc the limit is silently ignored.
-    let _ = monty_alloc::set_limit(resource_limits.max_memory, false);
+    // The interpreter raises MemoryError at its checkpoints once usage crosses
+    // max_memory. The allocator's hard ceiling sits above that with headroom
+    // for the exception machinery, and traps the instance if an allocation
+    // between checkpoints overshoots it — or if the limit is unset, never.
+    let _ = monty_alloc::set_hard_limit(memory_limit_with_headroom(resource_limits.max_memory, false));
     let tracker = ResourceTracker::new(resource_limits);
 
     let mut print_writer = CollectPrintWriter::new();
@@ -1149,25 +1283,20 @@ pub extern "C" fn monty_start(
         runner.start(inputs, tracker, pw)
     };
 
-    let (status, result) =
-        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    let (status, result) = with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
     set_result_json(&result);
     status
 }
 
 /// Resume execution after a function call or OS call.
 #[no_mangle]
-pub extern "C" fn monty_resume(
-    snapshot_handle: u32,
-    return_value_ptr: u32,
-    return_value_len: u32,
-) -> u32 {
+pub extern "C" fn monty_resume(snapshot_handle: u32, return_value_ptr: u32, return_value_len: u32) -> u32 {
     let snapshot = with_state(|s| s.snapshots.remove(&snapshot_handle));
 
     let return_json = unsafe { read_str(return_value_ptr, return_value_len) };
-    // A host may answer with a value or ask for a Python exception to be
-    // raised at the call site; `parse_ext_result` distinguishes the two.
-    let return_value = parse_ext_result(&return_json);
+    // A host may answer with a value, ask for a Python exception to be raised
+    // at the call site, defer the answer, or abort the run.
+    let reply = parse_host_reply(&return_json);
 
     let mut print_writer = CollectPrintWriter::new();
 
@@ -1175,53 +1304,56 @@ pub extern "C" fn monty_resume(
     // OsCall) has its own `resume()` method that consumes self.
     let initial = {
         let pw = PrintWriter::Callback(&mut print_writer);
-        match snapshot {
-            Some(SnapshotState::FunctionCall(call)) => {
-                // `{"__monty__": "future"}` means the host is servicing this
-                // call asynchronously: the guest gets an awaitable, and the
-                // result arrives later through `monty_resume_futures`. The
-                // call id correlating the two is only known here, which is why
-                // this is not folded into `parse_ext_result`.
-                let result = if is_future_request(&return_value) {
-                    ExtFunctionResult::Future(call.call_id)
-                } else {
-                    return_value
-                };
-                call.resume(result, pw)
+        match (snapshot, reply) {
+            // `{"__monty__": "future"}` means the host is servicing this call
+            // asynchronously: the guest gets an awaitable, and the result
+            // arrives later through `monty_resume_futures`. The call id
+            // correlating the two is only known here, which is why this is
+            // not folded into `parse_host_reply`.
+            (Some(SnapshotState::FunctionCall(call)), HostReply::Future) => {
+                let call_id = call.call_id;
+                call.resume(ExtFunctionResult::Future(call_id), pw)
             }
-            // No future arm here: an OS call has no await point in the guest
-            // (`Path.read_text()` is a plain call), so a future would only
-            // leave a coroutine nobody awaits. The Go bridge rejects Pending
-            // from an OS-call handler with that explanation.
-            Some(SnapshotState::OsCall(call)) => call.resume(return_value, pw),
+            (Some(SnapshotState::FunctionCall(call)), HostReply::Result(result)) => call.resume(result, pw),
+            (Some(SnapshotState::FunctionCall(call)), HostReply::Abort(exc)) => call.abort(exc, pw),
+            // Only `asyncio.sleep` has an await point behind it; any other OS
+            // call is a plain call in the guest, so a future would leave a
+            // coroutine nobody awaits. The Go bridge refuses Pending for those
+            // before it gets here.
+            (Some(SnapshotState::OsCall(call)), HostReply::Future) => {
+                if OsFunctionCall::accepts_future(call.function_call.name()) {
+                    let call_id = call.call_id;
+                    call.resume(ExtFunctionResult::Future(call_id), pw)
+                } else {
+                    let exc = MontyException::new(
+                        ExcType::RuntimeError,
+                        Some(format!("'{}' cannot be answered with a future", call.function_call.name())),
+                    );
+                    call.abort(exc, pw)
+                }
+            }
+            (Some(SnapshotState::OsCall(call)), HostReply::Result(result)) => call.resume(result, pw),
+            (Some(SnapshotState::OsCall(call)), HostReply::Abort(exc)) => call.abort(exc, pw),
             _ => {
-                set_result_json(&str_error_result("invalid snapshot handle", String::new()));
+                set_result_json(&str_error_result("invalid snapshot handle"));
                 return 0;
             }
         }
     };
 
-    let (status, result) =
-        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    let (status, result) = with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
     set_result_json(&result);
     status
 }
 
 /// Resume execution after resolving futures.
 #[no_mangle]
-pub extern "C" fn monty_resume_futures(
-    snapshot_handle: u32,
-    results_ptr: u32,
-    results_len: u32,
-) -> u32 {
+pub extern "C" fn monty_resume_futures(snapshot_handle: u32, results_ptr: u32, results_len: u32) -> u32 {
     let snapshot = with_state(|s| s.snapshots.remove(&snapshot_handle));
     let snapshot = match snapshot {
         Some(SnapshotState::ResolveFutures(s)) => s,
         _ => {
-            set_result_json(&str_error_result(
-                "invalid future snapshot handle",
-                String::new(),
-            ));
+            set_result_json(&str_error_result("invalid future snapshot handle"));
             return 0;
         }
     };
@@ -1234,24 +1366,32 @@ pub extern "C" fn monty_resume_futures(
         serde_json::from_str(&results_json).unwrap_or_default()
     };
 
-    let results: Vec<(u32, ExtFunctionResult)> = pairs
-        .into_iter()
-        .map(|(id, val)| {
-            // Each resolved future carries a value or a request to raise, the
-            // same as a plain resume.
-            let json = serde_json::to_string(&val).unwrap_or_default();
-            (id, parse_ext_result(&json))
-        })
-        .collect();
+    let mut results = Vec::with_capacity(pairs.len());
+    let mut abort = None;
+    for (id, val) in pairs {
+        // Each resolved future carries a value or a request to raise, the
+        // same as a plain resume.
+        let json = serde_json::to_string(&val).unwrap_or_default();
+        match parse_host_reply(&json) {
+            HostReply::Result(result) => results.push((id, result)),
+            HostReply::Abort(exc) => abort = Some(exc),
+            HostReply::Future => {
+                set_result_json(&str_error_result("a resolved future cannot itself be a future"));
+                return 0;
+            }
+        }
+    }
 
     let mut print_writer = CollectPrintWriter::new();
     let initial = {
         let pw = PrintWriter::Callback(&mut print_writer);
-        snapshot.resume(results, pw)
+        match abort {
+            Some(exc) => snapshot.abort(exc, pw),
+            None => snapshot.resume(results, pw),
+        }
     };
 
-    let (status, result) =
-        with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
+    let (status, result) = with_param_registry(|reg| drive_progress(initial, &mut print_writer, reg));
     set_result_json(&result);
     status
 }
