@@ -26,7 +26,7 @@ tokyo = search(query="weather tokyo")
 compare(a=london, b=tokyo)
 ```
 
-One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 6MB WASM binary embedded in your Go binary.
+One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 7MB WASM binary embedded in your Go binary.
 
 For motivation, see:
 - [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
@@ -277,7 +277,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (6.0 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (6.7 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
@@ -402,8 +402,24 @@ case "open":
 
 Python then gets a real file: `read()`, `read(n)`, `readline()`,
 `readlines()`, `write()`, `seek()`, `tell()`, `close()`, `with open(...) as f`,
-and `.name` / `.mode` / `.closed`. Iterating a file (`for line in f`) is not
-supported upstream — use `readlines()`.
+and `.name` / `.mode` / `.closed`, and iterating it (`for line in f`).
+
+### Directory scans
+
+`os.scandir`, `os.walk`, `Path.walk`, `Path.glob` and `Path.rglob` all arrive
+as one `Path.scan` call for a bounded subtree: the path, plus `max_depth`
+(absent for the whole tree), `follow_symlinks` and, for a glob, the `pattern`
+parts in `Kwargs`. Answer with every entry within `max_depth`, the root
+included as `""`, each as `[relPath, isDir, isFile, isSymlink]`; monty walks
+or globs the reply itself, so extra entries are harmless. See upstream's
+`monty_types::scan` for the full contract.
+
+### Imports
+
+Since monty v1.2 an import the interpreter has no builtin module for is asked
+of the host as an `import` OS call. This bridge cannot send a module value, so
+it answers the call itself and the guest gets the `ModuleNotFoundError` it
+always did; your handler never sees it.
 
 ### Raising Python exceptions from a handler
 
@@ -457,7 +473,7 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty v1.1.0](https://github.com/pydantic/monty/releases/tag/v1.1.0).
+Tracks upstream [Monty v1.3.0](https://github.com/pydantic/monty/releases/tag/v1.3.0).
 
 - Arithmetic, string operations, f-strings, `%`-formatting, `format()`, slicing, `complex` numbers
 - Functions, lambdas, closures, decorators on functions and classes; `eval()`, `exec()` and `locals()`
@@ -471,20 +487,21 @@ Tracks upstream [Monty v1.1.0](https://github.com/pydantic/monty/releases/tag/v1
 - Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
 - Multi-module imports (`import a, b, c`)
-- Stdlib modules: `asyncio`, `base64`, `binascii`, `collections`, `copy`, `dataclasses`, `datetime` (with time zones), `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `random`, `re`, `sys`, `time`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.1.0/docs/limitations)
+- Stdlib modules: `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.3.0/docs/limitations)
 - `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc), relative to a working directory (`os.getcwd()`/`os.chdir()`)
 - `print(..., file=sys.stderr)` as its own stream
 - Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently
 - Host failures as catchable Python exceptions (`PyError`)
 - Class definitions and methods; dataclasses
 - Context managers (`with ...`)
+- `match` statements
 - Class instances flow through external function calls (args, returns, and method calls surface with `method_call=true`)
 - Resource limits: time (per run and per turn), memory, recursion depth, suspensions (host calls per run) and total sleep
 
 ## What Monty Cannot Do
 
 - Class inheritance (`class Foo(Bar):` is rejected at parse time), `super()`, and the `@classmethod`/`@staticmethod`/`@property` decorators
-- Generator functions (`yield`; generator expressions materialize to lists), `match` statements, `del`, `async with`/`async for`, exception groups, PEP 695 type aliases
+- Generator functions (`yield`; generator expressions materialize to lists), `del`, `async with`/`async for`, exception groups, PEP 695 type aliases
 - Ordering comparisons between `Path` objects (`sorted(Path(".").iterdir())` raises `TypeError`; sort the strings)
 - Rest of stdlib and all third-party libraries
 - `float('inf')` / `float('nan')` (JSON serialization limitation in this bridge)

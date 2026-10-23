@@ -211,6 +211,9 @@ fn monty_to_json(obj: ObjectRef<'_>) -> JsonValue {
         // A reference back to an enclosing container, as the placeholder its
         // repr shows (`[...]`, `{...}`, ...).
         MontyNode::Cycle(placeholder) => tagged("cycle", [("repr", JsonValue::String(placeholder.clone()))]),
+        // A host-provided module. This bridge defines none, so one can only
+        // reach here by name; like a class it cannot be sent back.
+        MontyNode::Module { name, .. } => tagged("module", [("name", JsonValue::String(name.clone()))]),
     }
 }
 
@@ -954,6 +957,23 @@ fn drive_progress(
             // and answered with `NotFound`, which raises that NameError.
             Ok(RunProgress::FunctionCall(call)) if !param_registry.contains_key(&call.function_name) => {
                 let name = call.function_name.clone();
+                let pw = PrintWriter::Callback(print_writer);
+                result = call.resume(ExtFunctionResult::NotFound(name), pw);
+            }
+            // A module the interpreter has no builtin for is asked of the
+            // host. The bridge has no way to send a module across, so it
+            // answers `NotFound` itself, which raises the same catchable
+            // `ModuleNotFoundError` an unknown import always did, rather than
+            // handing every OS handler a call it can only fail. Stub requests
+            // only come before a type-checked feed, which this bridge never
+            // runs, and get the same answer.
+            Ok(RunProgress::OsCall(call))
+                if matches!(
+                    call.function_call,
+                    OsFunctionCall::Import(_) | OsFunctionCall::ImportStubs(_)
+                ) =>
+            {
+                let name = call.function_call.name().to_owned();
                 let pw = PrintWriter::Callback(print_writer);
                 result = call.resume(ExtFunctionResult::NotFound(name), pw);
             }

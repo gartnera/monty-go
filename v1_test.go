@@ -452,6 +452,69 @@ rng = random.Random(7)
 	}
 }
 
+func TestMontyV13Language(t *testing.T) {
+	r := newRunner(t)
+	code := `
+import bisect, csv, hashlib, os, tomllib
+def kind(v):
+    match v:
+        case {"x": x}:
+            return f"point {x}"
+        case [first, *_]:
+            return f"seq {first}"
+        case _:
+            return "other"
+rows = list(csv.reader(["a,b", "1,2"]))
+[
+    kind({"x": 1}),
+    kind([7, 8]),
+    tomllib.loads('n = 3')["n"],
+    rows[1],
+    bisect.bisect([1, 3, 5], 4),
+    hashlib.sha256(b"hi").hexdigest()[:8],
+    os.path.join("a", "b"),
+]
+`
+	got, err := r.Execute(context.Background(), code, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	want := []any{"point 1", "seq 7", float64(3), []any{"1", "2"}, float64(2), "8f434346", "a/b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+// Since monty v1.2 an import the interpreter has no builtin for is asked of
+// the host as an OS call. The bridge answers it itself, so a handler never
+// sees it and the guest gets the catchable error CPython would raise.
+func TestUnknownImportIsModuleNotFoundError(t *testing.T) {
+	r := newRunner(t)
+	handler, calls := recordOsCalls(func(c *OsCall) (any, error) {
+		return nil, errors.New("unexpected OS call " + c.Function)
+	})
+	code := `
+try:
+    import numpy
+    r = "imported"
+except ImportError as e:
+    r = type(e).__name__ + ": " + str(e)
+r
+`
+	for _, opts := range [][]ExecuteOption{nil, {WithOsCallFunc(handler)}} {
+		got, err := r.Execute(context.Background(), code, nil, opts...)
+		if err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		if want := "ModuleNotFoundError: No module named 'numpy'"; got != want {
+			t.Fatalf("got %#v, want %#v", got, want)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("handler saw %d OS call(s): %#v", len(*calls), *calls)
+	}
+}
+
 func TestUndeclaredFunctionIsNameError(t *testing.T) {
 	r := newRunner(t)
 	code := `

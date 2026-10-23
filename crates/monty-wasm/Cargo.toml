@@ -7,16 +7,21 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.3.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # tzdb-bundled compiles the IANA zone rules in, so a host can give the
 # sandbox a named local zone (Europe/London) with its DST transitions; the
 # wasm module has no filesystem to read a system tz database from.
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0", features = ["tzdb-bundled"] }
-monty-alloc = { git = "https://github.com/pydantic/monty.git", tag = "v1.1.0" }
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.3.0", features = ["tzdb-bundled"] }
+monty-alloc = { git = "https://github.com/pydantic/monty.git", tag = "v1.3.0" }
 # Needed to parse an arbitrary-precision int a host sends across the JSON
 # boundary as a digit string (MontyObject::BigInt). Already in the lock file
 # via monty itself.
 num-bigint = "0.4"
 base64 = "0.22"
+# monty asserts HeapData fits 56 bytes on 32-bit targets, which a Tuple's
+# SmallVec only does with the "union" layout (no separate enum tag). Upstream's
+# own wasm build gets the feature unified in from other deps; a standalone
+# build of monty has to ask for it.
+smallvec = { version = "1.13", features = ["union"] }
