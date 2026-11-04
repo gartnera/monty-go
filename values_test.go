@@ -214,6 +214,12 @@ func TestTypedReturnValues(t *testing.T) {
 			want: "int 9223372036854775809",
 		},
 		{
+			name: "decimal",
+			prog: "import os\nv = os.getenv('X')\nprint(type(v).__name__, v + v)",
+			ret:  Decimal("1.20"),
+			want: "Decimal 2.40",
+		},
+		{
 			name: "timedelta",
 			prog: "import os\nv = os.getenv('X')\nprint(type(v).__name__, v.days, v.seconds)",
 			ret:  TimeDelta{Days: 3, Seconds: 60},
@@ -485,6 +491,15 @@ func TestGuestValuesRoundTrip(t *testing.T) {
 				t.Errorf("got %+v", d)
 			}
 		}},
+		{"decimal", `Decimal("1.20") * 3`, func(t *testing.T, got any) {
+			d, ok := got.(Decimal)
+			if !ok {
+				t.Fatalf("got %T, want montygo.Decimal", got)
+			}
+			if d != "3.60" {
+				t.Errorf("got %q, want 3.60", d)
+			}
+		}},
 		{"bigint", `2 ** 70`, func(t *testing.T, got any) {
 			b, ok := got.(BigInt)
 			if !ok {
@@ -499,7 +514,7 @@ func TestGuestValuesRoundTrip(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			// Sent out through an external call, then returned unchanged and
 			// printed, so both directions are exercised at once.
-			prog := "from pathlib import Path\nfrom datetime import date, timedelta\nprint(echo(" + c.expr + "))"
+			prog := "from pathlib import Path\nfrom datetime import date, timedelta\nfrom decimal import Decimal\nprint(echo(" + c.expr + "))"
 			var got any
 			out, err := run(t, r, prog, nil,
 				WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {

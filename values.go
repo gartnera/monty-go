@@ -33,7 +33,7 @@ import (
 // FunctionCall.Args or Execute's result:
 //
 //	Bytes, Complex, Date, DateTime, Time, TimeDelta, TimeZone, FileHandle,
-//	BigInt (only past int64), TypeValue, BuiltinFunction, Function,
+//	BigInt (only past int64), Decimal, TypeValue, BuiltinFunction, Function,
 //	Repr, Cycle, NotImplemented
 //
 // A Python tuple, set, frozenset, named tuple, exception value, Path or `...`
@@ -319,6 +319,17 @@ func (b BigInt) MarshalJSON() ([]byte, error) {
 		return json.Marshal(tagged("bigint", map[string]any{"value": "0"}))
 	}
 	return json.Marshal(tagged("bigint", map[string]any{"value": b.String()}))
+}
+
+// Decimal is a `decimal.Decimal`, as its canonical string form — what
+// `str(d)` prints: "1.20", "1E+5", "-NaN", "Infinity". The string round-trips
+// exactly, keeping precision and trailing zeros a float would lose. Sending
+// text Python's `Decimal(text)` would reject fails the run.
+type Decimal string
+
+// MarshalJSON implements [json.Marshaler].
+func (d Decimal) MarshalJSON() ([]byte, error) {
+	return json.Marshal(tagged("decimal", map[string]any{"value": string(d)}))
 }
 
 // ExceptionValue is an exception as a *value* — what `except E as e` binds, or
@@ -632,6 +643,8 @@ func decodeTagged(kind string, m map[string]any) (any, bool) {
 			return nil, false
 		}
 		return BigInt{Int: i}, true
+	case "decimal":
+		return Decimal(str(m, "value")), true
 	case "file":
 		return FileHandle{
 			Path:     str(m, "path"),
@@ -744,6 +757,8 @@ func plainValue(v any) any {
 			return "0"
 		}
 		return v.String()
+	case Decimal:
+		return string(v)
 	case ExceptionValue:
 		return map[string]any{"type": v.Type, "message": v.Message}
 	case TypeValue:

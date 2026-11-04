@@ -277,7 +277,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (6.7 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (7.0 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
@@ -359,6 +359,7 @@ Go value. You can return any of these from a handler:
 | `datetime.timezone` | `montygo.TimeZone` |
 | an open file (`_io.TextIOWrapper`, ...) | `montygo.FileHandle` |
 | an `int` beyond int64 | `montygo.BigInt` |
+| `decimal.Decimal` | `montygo.Decimal` (its `str()` form) |
 | an exception value | `montygo.ExceptionValue` |
 | `type`, a builtin, a function | `montygo.TypeValue`, `montygo.BuiltinFunction`, `montygo.Function` |
 | `...`, `NotImplemented` | `montygo.Ellipsis`, `montygo.NotImplemented` |
@@ -370,7 +371,7 @@ string form, and `Path.read_bytes`, `Path.stat`, `date.today` and
 **The two directions are not symmetric.** Every type above can be *sent*; only
 the ones JSON cannot carry faithfully come back in `OsCall.Args`,
 `FunctionCall.Args` or `Execute`'s result — `Bytes`, `Complex`, the date/time types,
-`FileHandle`, `BigInt` (only past int64), `TypeValue`, `BuiltinFunction`,
+`FileHandle`, `BigInt` (only past int64), `Decimal`, `TypeValue`, `BuiltinFunction`,
 `Function`, `Repr`, `Cycle` and `NotImplemented`. A Python tuple, set, named
 tuple, exception value or `Path` arrives as its plain shape (`[]any`,
 `map[string]any`, a string), because that is what handlers want: every
@@ -473,7 +474,7 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty v1.3.0](https://github.com/pydantic/monty/releases/tag/v1.3.0).
+Tracks upstream [Monty 1.4.0](https://github.com/pydantic/monty/releases/tag/1.4.0).
 
 - Arithmetic, string operations, f-strings, `%`-formatting, `format()`, slicing, `complex` numbers
 - Functions, lambdas, closures, decorators on functions and classes; `eval()`, `exec()` and `locals()`
@@ -487,7 +488,7 @@ Tracks upstream [Monty v1.3.0](https://github.com/pydantic/monty/releases/tag/v1
 - Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
 - Multi-module imports (`import a, b, c`)
-- Stdlib modules: `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.3.0/docs/limitations)
+- Stdlib modules: `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `decimal`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/1.4.0/docs/limitations)
 - `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc), relative to a working directory (`os.getcwd()`/`os.chdir()`)
 - `print(..., file=sys.stderr)` as its own stream
 - Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently

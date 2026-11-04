@@ -192,6 +192,8 @@ fn monty_to_json(obj: ObjectRef<'_>) -> JsonValue {
                 ("name", opt_str(&tz.name)),
             ],
         ),
+        // As its canonical `str(d)` form, which round-trips exactly.
+        MontyNode::Decimal(text) => tagged("decimal", [("value", JsonValue::String(text.clone()))]),
         MontyNode::Type(ty) => tagged("type", [("name", JsonValue::String(ty.name().to_owned()))]),
         // A class defined by the sandboxed code. Named like a builtin type:
         // the host can read which class it was, though sending the name back
@@ -485,6 +487,9 @@ fn json_to_tagged(map: &serde_json::Map<String, JsonValue>) -> Option<MontyObjec
         })),
         "exception" => Some(MontyObject::exception(s("type")?.parse().ok()?, opt_string("message"))),
         "bigint" => Some(MontyObject::bigint(s("value")?.parse().ok()?)),
+        // The sandbox parses the text as `Decimal(text)` would and rejects a
+        // malformed one itself.
+        "decimal" => Some(MontyObject::decimal(s("value")?)),
         "file" => Some(MontyObject::file_handle(MontyFileHandle {
             path: opt_string("path")?,
             mode: s("mode")?.parse().ok()?,
