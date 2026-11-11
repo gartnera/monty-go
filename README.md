@@ -26,7 +26,7 @@ tokyo = search(query="weather tokyo")
 compare(a=london, b=tokyo)
 ```
 
-One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 7MB WASM binary embedded in your Go binary.
+One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 7.5MB WASM binary embedded in your Go binary.
 
 For motivation, see:
 - [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
@@ -277,7 +277,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (7.0 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (7.5 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
@@ -474,7 +474,7 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty 1.4.0](https://github.com/pydantic/monty/releases/tag/1.4.0).
+Tracks upstream [Monty v1.5.0](https://github.com/pydantic/monty/releases/tag/v1.5.0).
 
 - Arithmetic, string operations, f-strings, `%`-formatting, `format()`, slicing, `complex` numbers
 - Functions, lambdas, closures, decorators on functions and classes; `eval()`, `exec()` and `locals()`
@@ -488,7 +488,7 @@ Tracks upstream [Monty 1.4.0](https://github.com/pydantic/monty/releases/tag/1.4
 - Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
 - Multi-module imports (`import a, b, c`)
-- Stdlib modules: `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `decimal`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/1.4.0/docs/limitations)
+- Stdlib modules: `annotationlib`, `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `decimal`, `fnmatch`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.5.0/docs/limitations)
 - `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc), relative to a working directory (`os.getcwd()`/`os.chdir()`)
 - `print(..., file=sys.stderr)` as its own stream
 - Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently

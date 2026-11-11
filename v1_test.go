@@ -8,6 +8,7 @@ package montygo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"reflect"
 	"strings"
@@ -508,6 +509,37 @@ r
 		}
 		if want := "ModuleNotFoundError: No module named 'numpy'"; got != want {
 			t.Fatalf("got %#v, want %#v", got, want)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("handler saw %d OS call(s): %#v", len(*calls), *calls)
+	}
+}
+
+// Since monty v1.5 typing.get_type_hints() of a host function is asked of
+// the host as an OS call. The bridge carries no hints, so it answers {} itself
+// instead of failing the run when no OS handler is configured.
+func TestGetTypeHintsOfHostFunction(t *testing.T) {
+	r := newRunner(t)
+	handler, calls := recordOsCalls(func(c *OsCall) (any, error) {
+		return nil, errors.New("unexpected OS call " + c.Function)
+	})
+	code := `
+import typing
+def local(a: int) -> str:
+    return str(a)
+[typing.get_type_hints(fetch), sorted(typing.get_type_hints(local))]
+`
+	ext := WithExternalFunc(func(ctx context.Context, call *FunctionCall) (any, error) {
+		return nil, errors.New("fetch should not be called")
+	}, Func("fetch"))
+	for _, opts := range [][]ExecuteOption{{ext}, {ext, WithOsCallFunc(handler)}} {
+		got, err := r.Execute(context.Background(), code, nil, opts...)
+		if err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		if s := fmt.Sprint(got); s != "[map[] [a return]]" {
+			t.Fatalf("got %s", s)
 		}
 	}
 	if len(*calls) != 0 {

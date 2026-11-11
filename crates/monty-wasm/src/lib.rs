@@ -971,16 +971,22 @@ fn drive_progress(
             // `ModuleNotFoundError` an unknown import always did, rather than
             // handing every OS handler a call it can only fail. Stub requests
             // only come before a type-checked feed, which this bridge never
-            // runs, and get the same answer.
+            // runs, and get the same answer. `typing.get_type_hints()` of a
+            // host function asks the host for its hints; the bridge carries
+            // none, so it gets upstream's no-handler answer (`{}`) here rather
+            // than failing the run when no OS handler is configured.
             Ok(RunProgress::OsCall(call))
                 if matches!(
                     call.function_call,
-                    OsFunctionCall::Import(_) | OsFunctionCall::ImportStubs(_)
+                    OsFunctionCall::Import(_) | OsFunctionCall::ImportStubs(_) | OsFunctionCall::GetTypeHints(_)
                 ) =>
             {
-                let name = call.function_call.name().to_owned();
+                let answer = match &call.function_call {
+                    OsFunctionCall::GetTypeHints(_) => call.function_call.no_handler_result(),
+                    other => ExtFunctionResult::NotFound(other.name().to_owned()),
+                };
                 let pw = PrintWriter::Callback(print_writer);
-                result = call.resume(ExtFunctionResult::NotFound(name), pw);
+                result = call.resume(answer, pw);
             }
             Ok(progress) => {
                 let mut pr = progress_to_result(progress, param_registry);
