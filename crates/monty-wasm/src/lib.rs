@@ -202,7 +202,9 @@ fn monty_to_json(obj: ObjectRef<'_>) -> JsonValue {
         MontyNode::BuiltinFunction(func) => {
             tagged("builtin", [("name", JsonValue::String(func.to_string()))])
         }
-        MontyNode::Function { name, docstring } => tagged(
+        // `is_async` is left out: the bridge only ever hands the guest sync
+        // host functions (`MontyObject::function`), so it is always false here.
+        MontyNode::Function { name, docstring, .. } => tagged(
             "function",
             [
                 ("name", JsonValue::String(name.clone())),

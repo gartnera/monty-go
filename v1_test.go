@@ -597,3 +597,19 @@ func TestBoundedBuffer(t *testing.T) {
 		t.Fatalf("got %q", b.String())
 	}
 }
+
+// A host function referenced as a value, not called, reaches Go as a
+// Function carrying its name.
+func TestHostFunctionAsValue(t *testing.T) {
+	r := newRunner(t)
+	got, err := r.Execute(context.Background(), "fetch", nil,
+		WithExternalFunc(func(context.Context, *FunctionCall) (any, error) {
+			return nil, errors.New("fetch should not be called")
+		}, Func("fetch")))
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if fn, ok := got.(Function); !ok || fn.Name != "fetch" {
+		t.Fatalf("got %#v, want Function{Name: \"fetch\"}", got)
+	}
+}
