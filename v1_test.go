@@ -613,3 +613,126 @@ func TestHostFunctionAsValue(t *testing.T) {
 		t.Fatalf("got %#v, want Function{Name: \"fetch\"}", got)
 	}
 }
+
+// TestCreateTaskWithPendingHostCalls covers asyncio.create_task and
+// asyncio.wait (monty v1.7.0) over async host calls: both tasks' host calls
+// must be outstanding before the resolver answers either.
+func TestCreateTaskWithPendingHostCalls(t *testing.T) {
+	r := newRunner(t)
+	prog := `import asyncio
+
+async def get(n):
+    return await fetch(n)
+
+async def main():
+    t1 = asyncio.create_task(get(1))
+    t2 = asyncio.create_task(get(2))
+    done, _ = await asyncio.wait([t1, t2])
+    return len(done), t1.result() + t2.result()
+
+print(asyncio.run(main()))`
+
+	var pendingSeen [][]uint32
+	out, err := run(t, r, prog, nil,
+		WithExternalFunc(func(context.Context, *FunctionCall) (any, error) {
+			return Pending{}, nil
+		}, Func("fetch", "n")),
+		WithFutureResolver(func(_ context.Context, callIDs []uint32) (map[uint32]any, error) {
+			pendingSeen = append(pendingSeen, callIDs)
+			results := make(map[uint32]any, len(callIDs))
+			for _, id := range callIDs {
+				results[id] = 10
+			}
+			return results, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if want := "(2, 20)"; strings.TrimSuffix(out, "\n") != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+	if len(pendingSeen) == 0 || len(pendingSeen[0]) != 2 {
+		t.Errorf("resolver calls %v, want both host calls outstanding at once", pendingSeen)
+	}
+}
+
+// TestV17Stdlib pins a few of the language and stdlib additions in monty
+// v1.7.0.
+func TestV17Stdlib(t *testing.T) {
+	r := newRunner(t)
+	tests := []struct {
+		name, code string
+		want       any
+	}{
+		{"statistics", "import statistics\nstatistics.mean([1, 2, 3, 4])", 2.5},
+		{"float hex roundtrip", "float.fromhex((0.1).hex()) == 0.1", true},
+		{"as_integer_ratio", "(0.75).as_integer_ratio()", []any{float64(3), float64(4)}},
+		{"bytes translate", "b'abc'.translate(bytes.maketrans(b'ab', b'xy'))", Bytes("xyc")},
+		{"star import", "from math import *\nfloor(pi)", float64(3)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := r.Execute(context.Background(), tt.code, nil)
+			if err != nil {
+				t.Fatalf("Execute failed: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %#v (%T), want %#v (%T)", got, got, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+// TestBinaryWritesArePositional pins the OS calls a binary file object sends
+// since monty v1.7.0: each f.write(b) on a "wb" file is one
+// Path.write_bytes_at carrying the offset it writes at, answered with the
+// byte count, where earlier releases sent Path.write_bytes then
+// Path.append_bytes.
+func TestBinaryWritesArePositional(t *testing.T) {
+	r := newRunner(t)
+	var file []byte
+	handler, calls := recordOsCalls(func(call *OsCall) (any, error) {
+		switch call.Function {
+		case "open":
+			file = nil
+			return FileHandle{Path: call.Args[0].(string), Mode: call.Args[1].(string)}, nil
+		case "Path.write_bytes_at":
+			offset, data := int(call.Args[1].(float64)), call.Args[2].(Bytes)
+			if offset > len(file) {
+				return nil, &PyError{Type: "OSError", Message: "write past end of file"}
+			}
+			file = append(file[:offset], data...)
+			return len(data), nil
+		}
+		return nil, fmt.Errorf("unexpected OS call %s", call.Function)
+	})
+	code := `
+with open("out.bin", "wb") as f:
+    f.write(b"ab")
+    f.write(b"cd")
+    pos = f.tell()
+pos
+`
+	got, err := r.Execute(context.Background(), code, nil, WithOsCallFunc(handler))
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if got != float64(4) {
+		t.Fatalf("tell() = %#v, want 4", got)
+	}
+	if string(file) != "abcd" {
+		t.Fatalf("file = %q, want %q", file, "abcd")
+	}
+	var seen []string
+	for _, c := range *calls {
+		if c.Function == "Path.write_bytes_at" {
+			seen = append(seen, fmt.Sprintf("%v@%v", string(c.Args[2].(Bytes)), c.Args[1]))
+		} else {
+			seen = append(seen, c.Function)
+		}
+	}
+	if want := []string{"open", "ab@0", "cd@2"}; !reflect.DeepEqual(seen, want) {
+		t.Fatalf("OS calls %v, want %v", seen, want)
+	}
+}

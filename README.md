@@ -26,7 +26,7 @@ tokyo = search(query="weather tokyo")
 compare(a=london, b=tokyo)
 ```
 
-One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just a 7.4MB WASM binary embedded in your Go binary.
+One model call instead of three. The Python code calls your Go functions, Monty pauses at each call, your Go code executes it, and Monty resumes. No containers. No sandbox services. No `exec()`. Just an 8.1MB WASM binary embedded in your Go binary.
 
 For motivation, see:
 - [Programmatic Tool Calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling) from Anthropic
@@ -277,7 +277,7 @@ Gollem gives you compile-time type safety, structured output, guardrails, cost t
 │  │  wazero (pure Go WASM runtime)  │                    │
 │  │                                 │                    │
 │  │  ┌───────────────────────────┐  │                    │
-│  │  │  monty.wasm (7.4 MB)      │  │  ◄── go:embed      │
+│  │  │  monty.wasm (8.1 MB)      │  │  ◄── go:embed      │
 │  │  │  Monty Python Interpreter │  │                    │
 │  │  │  compiled to wasm32-wasi  │  │                    │
 │  │  └──────────┬────────────────┘  │                    │
@@ -382,14 +382,24 @@ filesystem OS call passes its path as a string.
 > `call.Args[1].([]any)` needs `call.Args[1].(montygo.Bytes)`. Path arguments
 > are unchanged — still plain strings.
 
+> **Upgrading to monty v1.7.0:** `f.write(b)` on a file opened `"wb"` (or the
+> new `"wb+"`) no longer arrives as `Path.write_bytes` then `Path.append_bytes`;
+> every write is one `Path.write_bytes_at` call carrying the file offset. Upstream
+> keeps the old calls only behind a REPL-only switch, so `Execute` cannot opt out.
+> Binary appends (`"ab"`) still arrive as `Path.append_bytes`.
+
 ### `open()`
 
 `open()` works, and needs one thing from your `OsCallFunc`: answer the `open`
 call with a `montygo.FileHandle`. Monty holds no file descriptor — it builds
 its own file object from the handle, and each later read or write arrives as an
-ordinary one-shot `Path.read_text` / `Path.write_text` call. So the handler
-performs the open-time effect (truncate for `"w"`, create for `"a"`, an
-existence check for `"r"`) and returns the handle:
+ordinary one-shot `Path.read_text` / `Path.write_text` call — except a write to
+a binary file opened for writing (`"wb"`, `"wb+"`), which arrives as
+`Path.write_bytes_at` with `[path, offset, montygo.Bytes]` and must be answered
+with the number of bytes written (at most `len(data)`). Refuse an offset past
+the end of the file, so one sandbox byte cannot grow a host file by the whole
+offset. So the handler performs the open-time effect (truncate for `"w"`,
+create for `"a"`, an existence check for `"r"`) and returns the handle:
 
 ```go
 case "open":
@@ -474,7 +484,7 @@ if errors.As(err, &me) {
 
 ## What Monty Can Do
 
-Tracks upstream [Monty v1.6.0](https://github.com/pydantic/monty/releases/tag/v1.6.0).
+Tracks upstream [Monty v1.7.0](https://github.com/pydantic/monty/releases/tag/v1.7.0).
 
 - Arithmetic, string operations, f-strings, `%`-formatting, `format()`, slicing, `complex` numbers
 - Functions, lambdas, closures, decorators on functions and classes; `eval()`, `exec()` and `locals()`
@@ -487,11 +497,11 @@ Tracks upstream [Monty v1.6.0](https://github.com/pydantic/monty/releases/tag/v1
 - PEP 448 generalized unpacking (`*args`, `**kwargs` in calls, literals, etc.)
 - Nested and augmented subscript assignment (`a[i][j] = v`, `a[i] += 1`)
 - Tuple comparison (`<`, `>`, `<=`, `>=`)
-- Multi-module imports (`import a, b, c`)
-- Stdlib modules: `annotationlib`, `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `decimal`, `fnmatch`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.6.0/docs/limitations)
+- Multi-module imports (`import a, b, c`) and star imports (`from m import *`)
+- Stdlib modules: `annotationlib`, `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime` (with time zones), `decimal`, `fnmatch`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os` (with `os.path`), `pathlib`, `random`, `re`, `statistics`, `sys`, `time`, `tomllib`, `typing`, `unicodedata` — several are partial; see upstream's [limitations](https://github.com/pydantic/monty/tree/v1.7.0/docs/limitations)
 - `import os`, `from pathlib import Path`, and the `open()` builtin with real file objects (routed through OsCallFunc), relative to a working directory (`os.getcwd()`/`os.chdir()`)
 - `print(..., file=sys.stderr)` as its own stream
-- Async host calls: a handler returns `Pending` and `asyncio.gather` runs them concurrently
+- Async host calls: a handler returns `Pending` and `asyncio.gather`, `asyncio.create_task` and `asyncio.wait` run them concurrently
 - Host failures as catchable Python exceptions (`PyError`)
 - Class definitions and methods; dataclasses
 - Context managers (`with ...`)
